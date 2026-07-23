@@ -1,3 +1,4 @@
+import { type KeyLike } from "node:crypto";
 /**
  * Post-Jan-2025 H2D firmware requires mTLS with a Bambu-issued client cert.
  * Loads cert+key from explicitly configured BAMBU_CLIENT_CERT and
@@ -8,6 +9,9 @@ export declare function loadClientCreds(): {
     cert: Buffer;
     key: Buffer;
 } | null;
+export declare function canonicalJson(value: any): string;
+export declare function createSignedPrintEnvelope(payload: Record<string, any>, privateKey: KeyLike, certId: string): Record<string, any>;
+export declare function requiresEncryptedGcodeLine(printerSerial: string): boolean;
 interface BambuPrintOptionsInternal {
     projectName: string;
     filePath: string;
@@ -36,6 +40,9 @@ export declare class BambuImplementation {
     private printerStore;
     constructor();
     private getPrinter;
+    private getIdlePrinter;
+    private publishPrintCommandAndWait;
+    private publishProjectFileAndWait;
     private resolveProjectFileMetadata;
     getStatus(host: string, serial: string, token: string): Promise<any>;
     print3mf(host: string, serial: string, token: string, options: BambuPrintOptionsInternal): Promise<any>;
@@ -43,6 +50,10 @@ export declare class BambuImplementation {
     pauseJob(host: string, serial: string, token: string): Promise<any>;
     resumeJob(host: string, serial: string, token: string): Promise<any>;
     clearHmsErrors(host: string, serial: string, token: string): Promise<any>;
+    resetAms(host: string, serial: string, token: string): Promise<any>;
+    loadAmsFilament(host: string, serial: string, token: string, slot: number, targetTemperature: number): Promise<any>;
+    unloadAmsFilament(host: string, serial: string, token: string): Promise<any>;
+    rebootPrinter(host: string, serial: string, token: string): Promise<any>;
     setPrintSpeed(host: string, serial: string, token: string, speedMode: string | number): Promise<any>;
     setAirductMode(host: string, serial: string, token: string, mode: string): Promise<any>;
     rereadAmsRfid(host: string, serial: string, token: string, amsId: number, slotId: number): Promise<any>;

@@ -1,0 +1,97 @@
+diff --git a/tools/pjarczak_bambu_linux_host/main.cpp b/tools/pjarczak_bambu_linux_host/main.cpp
+index 307a7fa2..d442ddca 100644
+--- a/tools/pjarczak_bambu_linux_host/main.cpp
++++ b/tools/pjarczak_bambu_linux_host/main.cpp
+@@ -2,6 +2,8 @@
+ #include "../../src/slic3r/Utils/PJarczakLinuxBridge/PJarczakLinuxSoBridgeRpcProtocol.hpp"
+ 
+ #include <cstdlib>
++#include <condition_variable>
++#include <deque>
+ #include <iostream>
+ #include <mutex>
+ #include <string>
+@@ -69,6 +71,42 @@ int main(int argc, char** argv)
+ 
+     LinuxPluginHost host;
+     std::mutex out_mutex;
++    struct PendingRpc {
++        RpcFrame request;
++        std::vector<unsigned char> binary;
++    };
++    std::mutex queue_mutex;
++    std::condition_variable queue_cv;
++    std::deque<PendingRpc> queue;
++    bool stopping = false;
++
++    auto dispatch = [&](RpcFrame request, std::vector<unsigned char> request_binary) {
++        LinuxPluginHost::set_thread_request_binary(std::move(request_binary));
++        nlohmann::json resp = host.handle(request.method, request.payload);
++
++        std::vector<unsigned char> reply_binary;
++        const bool has_reply_binary = LinuxPluginHost::consume_thread_reply_binary(reply_binary);
++
++        std::lock_guard<std::mutex> lock(out_mutex);
++        write_json_frame(rpc_out, RpcFrameType::json_response, request.id, resp);
++        if (has_reply_binary)
++            write_raw_frame(rpc_out, RpcFrameType::binary_data, request.id, reply_binary.data(), reply_binary.size());
++    };
++
++    std::thread worker([&] {
++        while (true) {
++            PendingRpc pending;
++            {
++                std::unique_lock<std::mutex> lock(queue_mutex);
++                queue_cv.wait(lock, [&] { return stopping || !queue.empty(); });
++                if (stopping && queue.empty())
++                    return;
++                pending = std::move(queue.front());
++                queue.pop_front();
++            }
++            dispatch(std::move(pending.request), std::move(pending.binary));
++        }
++    });
+ 
+     while (true) {
+         RawRpcFrame raw;
+@@ -96,19 +134,29 @@ int main(int argc, char** argv)
+             request_binary = std::move(binary_raw.payload);
+         }
+ 
+-        std::thread([&host, &rpc_out, &out_mutex, req_id = req.id, req_method = req.method, req_payload = req.payload, request_binary = std::move(request_binary)]() mutable {
+-            LinuxPluginHost::set_thread_request_binary(std::move(request_binary));
+-            nlohmann::json resp = host.handle(req_method, req_payload);
+-
+-            std::vector<unsigned char> reply_binary;
+-            const bool has_reply_binary = LinuxPluginHost::consume_thread_reply_binary(reply_binary);
++        const bool control_request =
++            req.method == "bridge.poll_events" ||
++            req.method == "bridge.job_cancel" ||
++            req.method == "bridge.job_wait_reply" ||
++            req.method == "bridge.callback_reply" ||
++            req.method == "ft.job_cancel";
++        if (control_request) {
++            dispatch(std::move(req), std::move(request_binary));
++            continue;
++        }
+ 
+-            std::lock_guard<std::mutex> lock(out_mutex);
+-            write_json_frame(rpc_out, RpcFrameType::json_response, req_id, resp);
+-            if (has_reply_binary)
+-                write_raw_frame(rpc_out, RpcFrameType::binary_data, req_id, reply_binary.data(), reply_binary.size());
+-        }).detach();
++        {
++            std::lock_guard<std::mutex> lock(queue_mutex);
++            queue.push_back({std::move(req), std::move(request_binary)});
++        }
++        queue_cv.notify_one();
+     }
+ 
++    {
++        std::lock_guard<std::mutex> lock(queue_mutex);
++        stopping = true;
++    }
++    queue_cv.notify_one();
++    worker.join();
+     return 0;
+ }

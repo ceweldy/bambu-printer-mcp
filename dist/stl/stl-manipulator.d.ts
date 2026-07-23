@@ -73,13 +73,17 @@ export declare class STLManipulator extends EventEmitter {
      * and #9968). Our flattener (src/slicer/profile-flatten.ts) reproduces
      * what the GUI does at slice time so the CLI accepts the configs.
      *
-     * Opt-in via `BAMBU_CLI_FLATTEN=true`. When the env var is unset or
-     * not "true"/"1", returns the bundle unchanged so behavior is
-     * backward-compatible. When enabled, only BBL-shipped leaves get
-     * flattened; user-provided custom configs pass through untouched.
+     * Enabled by default because BambuStudio's CLI silently falls back to
+     * default PLA metadata when it cannot resolve a leaf filament profile.
+     * Set `BAMBU_CLI_FLATTEN=false` or `0` only for debugging. User-provided
+     * custom configs still pass through untouched when they are not part of
+     * the installed BBL profile tree.
      */
     private maybeFlattenBundle;
     private resolveBambuStudioBedType;
+    private firstProfileValue;
+    private rewriteSuperTackSliceArchive;
+    private validateBambuSliceArchive;
     /** Read a profile JSON's top-level `name` field, or null if unreadable. */
     private readLeafName;
     /**
