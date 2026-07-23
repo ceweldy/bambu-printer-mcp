@@ -50,7 +50,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.0",
-    "bambu-js": "^2.2.2",
+    "bambu-js": "^3.0.1",
     "bambu-node": "^3.22.21",
     "basic-ftp": "^6.0.1",
     "dotenv": "^16.3.1",
