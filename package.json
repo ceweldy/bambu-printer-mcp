@@ -1,0 +1,78 @@
+{
+  "name": "@ceweldy/bambu-printer-mcp",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Privacy-conscious MCP server for managing, monitoring, slicing for, and controlling multiple Bambu Lab 3D printers",
+  "main": "dist/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ceweldy/bambu-printer-mcp.git"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node dist/index.js",
+    "start:stdio": "MCP_TRANSPORT=stdio node dist/index.js",
+    "start:http": "MCP_TRANSPORT=streamable-http node dist/index.js",
+    "build": "tsc",
+    "test": "npm run build && node --test tests/*.test.mjs tests/**/*.test.mjs",
+    "check": "npm test && npm audit --omit=dev && npm run privacy:check && npm run privacy:history && npm pack --dry-run",
+    "privacy:check": "node scripts/privacy-scan.mjs",
+    "privacy:history": "node scripts/history-privacy-scan.mjs",
+    "postinstall": "patch-package"
+  },
+  "bin": {
+    "bambu-printer-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "patches",
+    "docs",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "UPSTREAM.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "3d-printer",
+    "bambu",
+    "bambu-lab",
+    "bambu-studio",
+    "stl",
+    "3mf"
+  ],
+  "author": "ceweldy and contributors",
+  "license": "GPL-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "bambu-js": "^2.2.2",
+    "bambu-node": "^3.22.21",
+    "basic-ftp": "^6.0.1",
+    "dotenv": "^16.3.1",
+    "jszip": "^3.10.1",
+    "mqtt": "^5.15.1",
+    "patch-package": "^8.0.1",
+    "three": "^0.173.0",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/three": "^0.173.0",
+    "@types/xml2js": "^0.4.14",
+    "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "@hono/node-server": "^2.0.11",
+    "body-parser": "^2.3.0",
+    "fast-uri": "^4.1.1",
+    "hono": "^4.12.31",
+    "qs": "^6.15.3",
+    "tmp": "^0.2.7",
+    "ws": "^8.21.1"
+  }
+}

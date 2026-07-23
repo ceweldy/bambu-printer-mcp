@@ -1,0 +1,36 @@
+node_modules/
+npm-debug.log
+*.tsbuildinfo
+.env
+.env.local
+.env.*
+!.env.example
+temp/
+*.log
+.DS_Store
+.idea/
+.vscode/
+coverage/
+.claude/worktrees/
+
+# Local credentials and private fixtures (never commit)
+bambu certs/
+bambu-mcp-config.json
+printers.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.csr
+*.mqtt
+*.pcap
+*.pcapng
+camera-*.jpg
+camera-*.jpeg
+camera-*.png
+docs/*.gcode.3mf
+
+# BambuStudio CLI artifacts (drop-in next to current dir)
+result.json
