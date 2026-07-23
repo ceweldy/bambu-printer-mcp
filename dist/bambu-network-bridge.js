@@ -63,6 +63,12 @@ function assertBridgeOk(value, method) {
         throw new Error(`FULU BambuNetwork bridge method ${method} failed: ${errorText}`);
     }
 }
+export function redactBambuNetworkDiagnostic(message) {
+    return message.replace(/\[PJBRIDGE\][^\r\n]*/g, (line) => {
+        const kind = line.match(/"kind":"([^"]+)"/)?.[1] || "diagnostic";
+        return `[PJBRIDGE] {"kind":"${kind}","payload":"[redacted]"}`;
+    });
+}
 export class BambuNetworkBridge {
     constructor() {
         this.stdoutBuffer = Buffer.alloc(0);
@@ -224,6 +230,16 @@ export class BambuNetworkBridge {
         await withAgent("net.set_config_dir", { config_dir: configDir });
         await withAgent("net.init_log");
         await withAgent("net.set_country_code", { country_code: countryCode });
+        await withAgent("net.set_queue_on_main_fn");
+        await withAgent("net.set_on_printer_connected_fn", {}, false);
+        await withAgent("net.set_on_server_connected_fn", {}, false);
+        await withAgent("net.set_on_http_error_fn", {}, false);
+        await withAgent("net.set_on_subscribe_failure_fn", {}, false);
+        await withAgent("net.set_on_message_fn", {}, false);
+        await withAgent("net.set_on_user_message_fn", {}, false);
+        await withAgent("net.set_on_local_connect_fn", {}, false);
+        await withAgent("net.set_on_local_message_fn", {}, false);
+        await withAgent("net.set_server_callback", {}, false);
         await withAgent("net.start");
         await withAgent("net.connect_server", {}, false);
         if (userInfo) {
@@ -363,14 +379,15 @@ export class BambuNetworkBridge {
         const trimmed = message.trim();
         if (!trimmed)
             return;
-        this.recentLogs.push(trimmed);
+        this.recentLogs.push(redactBambuNetworkDiagnostic(trimmed));
         if (this.recentLogs.length > 25) {
             this.recentLogs = this.recentLogs.slice(-25);
         }
     }
     rememberStderr(message) {
         const combined = `${this.lastStderr}${message}`;
-        this.lastStderr = combined.length > 4000 ? combined.slice(-4000) : combined;
+        const sanitized = redactBambuNetworkDiagnostic(combined);
+        this.lastStderr = sanitized.length > 4000 ? sanitized.slice(-4000) : sanitized;
     }
     rejectAllPending(error) {
         for (const [id, pending] of this.pending.entries()) {

@@ -21,6 +21,7 @@ const BAMBU_CLI_BED_TYPES = {
     cool_plate: 'Cool Plate',
     engineering_plate: 'Engineering Plate',
     hot_plate: 'High Temp Plate',
+    supertack_plate: 'Bambu Cool Plate SuperTack',
 };
 export const SLICER_TYPES = [
     'bambustudio',
@@ -124,9 +125,30 @@ export class STLManipulator extends EventEmitter {
             return undefined;
         }
         for (const root of this.getAvailableProfileRoots()) {
-            const candidate = path.join(root, category, `${profileName}.json`);
+            const categoryRoot = path.join(root, category);
+            const candidate = path.join(categoryRoot, `${profileName}.json`);
             if (fs.existsSync(candidate)) {
                 return candidate;
+            }
+            const pending = [categoryRoot];
+            while (pending.length > 0) {
+                const current = pending.pop();
+                let entries;
+                try {
+                    entries = fs.readdirSync(current, { withFileTypes: true });
+                }
+                catch {
+                    continue;
+                }
+                for (const entry of entries) {
+                    const entryPath = path.join(current, entry.name);
+                    if (entry.isDirectory()) {
+                        pending.push(entryPath);
+                    }
+                    else if (entry.isFile() && entry.name === `${profileName}.json`) {
+                        return entryPath;
+                    }
+                }
             }
         }
         return undefined;
@@ -307,14 +329,15 @@ export class STLManipulator extends EventEmitter {
      * and #9968). Our flattener (src/slicer/profile-flatten.ts) reproduces
      * what the GUI does at slice time so the CLI accepts the configs.
      *
-     * Opt-in via `BAMBU_CLI_FLATTEN=true`. When the env var is unset or
-     * not "true"/"1", returns the bundle unchanged so behavior is
-     * backward-compatible. When enabled, only BBL-shipped leaves get
-     * flattened; user-provided custom configs pass through untouched.
+     * Enabled by default because BambuStudio's CLI silently falls back to
+     * default PLA metadata when it cannot resolve a leaf filament profile.
+     * Set `BAMBU_CLI_FLATTEN=false` or `0` only for debugging. User-provided
+     * custom configs still pass through untouched when they are not part of
+     * the installed BBL profile tree.
      */
     async maybeFlattenBundle(bundle, bambuOptions, activeSlicerPath) {
         const flag = process.env.BAMBU_CLI_FLATTEN;
-        if (flag !== 'true' && flag !== '1')
+        if (flag === 'false' || flag === '0')
             return bundle;
         if (!bundle.settingsArg)
             return bundle;
@@ -353,7 +376,12 @@ export class STLManipulator extends EventEmitter {
             };
         }
         catch (err) {
-            console.error(`[cli-flatten] failed, falling back to unflattened bundle: ${err?.message ?? err}`);
+            const bundlePaths = [...parts, ...bundle.filamentPaths];
+            const isInstalledBblBundle = bundlePaths.every((bundlePath) => bundlePath.includes(`${path.sep}profiles${path.sep}BBL${path.sep}`));
+            if (isInstalledBblBundle) {
+                throw new Error(`Could not resolve installed Bambu profiles for safe CLI slicing: ${err?.message ?? err}`);
+            }
+            console.warn(`[cli-flatten] custom profile bundle was not flattened: ${err?.message ?? err}`);
             return bundle;
         }
     }
@@ -361,10 +389,176 @@ export class STLManipulator extends EventEmitter {
         if (!bedType)
             return undefined;
         const normalized = bedType.trim().toLowerCase();
+        // BambuStudio 02.08 exposes SuperTack in the GUI but its CLI still
+        // validates raw STL imports as the legacy Cool Plate. Slice against the
+        // thermally compatible High Temp Plate, then rewrite the completed 3MF
+        // with the SuperTack metadata and temperature already present in the
+        // selected filament profile.
         if (normalized === 'supertack_plate') {
-            throw new Error('BambuStudio CLI SuperTack bed type is not verified; use a pre-sliced 3MF or choose textured_plate, cool_plate, engineering_plate, or hot_plate.');
+            return BAMBU_CLI_BED_TYPES.hot_plate;
         }
         return BAMBU_CLI_BED_TYPES[normalized] || bedType;
+    }
+    firstProfileValue(config, key) {
+        const value = config[key];
+        if (Array.isArray(value)) {
+            const first = value.find((entry) => String(entry).trim().length > 0);
+            return first === undefined ? undefined : String(first);
+        }
+        if (value === undefined || value === null || String(value).trim().length === 0) {
+            return undefined;
+        }
+        return String(value);
+    }
+    async rewriteSuperTackSliceArchive(filePath) {
+        const JSZip = (await import('jszip')).default;
+        const archive = await JSZip.loadAsync(fs.readFileSync(filePath));
+        const projectEntry = archive.file('Metadata/project_settings.config');
+        if (!projectEntry) {
+            throw new Error('Sliced 3MF is missing Metadata/project_settings.config.');
+        }
+        const projectConfig = JSON.parse(await projectEntry.async('string'));
+        projectConfig.curr_bed_type = 'Bambu Cool Plate SuperTack';
+        if ('default_bed_type' in projectConfig) {
+            projectConfig.default_bed_type = 'Bambu Cool Plate SuperTack';
+        }
+        archive.file('Metadata/project_settings.config', JSON.stringify(projectConfig, null, 4));
+        const plateJsonEntries = Object.values(archive.files).filter((entry) => !entry.dir && /^Metadata\/plate_\d+\.json$/i.test(entry.name));
+        const usedFilamentsByPlate = new Map();
+        for (const entry of plateJsonEntries) {
+            const plate = JSON.parse(await entry.async('string'));
+            const plateNumber = Number(entry.name.match(/plate_(\d+)\.json$/i)?.[1]);
+            const usedFilaments = Array.isArray(plate.filament_ids)
+                ? plate.filament_ids
+                    .map((value) => Number(value))
+                    .filter((value) => Number.isInteger(value) && value >= 0)
+                : [];
+            if (Number.isInteger(plateNumber)) {
+                usedFilamentsByPlate.set(plateNumber, usedFilaments);
+            }
+            plate.bed_type = 'supertack_plate';
+            archive.file(entry.name, JSON.stringify(plate));
+        }
+        const sliceInfoEntry = archive.file('Metadata/slice_info.config');
+        if (!sliceInfoEntry) {
+            throw new Error('Sliced 3MF is missing Metadata/slice_info.config.');
+        }
+        const superTackMetadata = '<metadata key="curr_bed_type" value="Bambu Cool Plate SuperTack"/>';
+        const sliceInfo = (await sliceInfoEntry.async('string')).replace(/<plate\b[^>]*>[\s\S]*?<\/plate>/gi, (plateBlock) => {
+            const existingMetadata = /<metadata\b(?=[^>]*\bkey="curr_bed_type")[^>]*\/>/i;
+            if (existingMetadata.test(plateBlock)) {
+                return plateBlock.replace(existingMetadata, superTackMetadata);
+            }
+            return plateBlock.replace(/<plate\b[^>]*>/i, (openingTag) => `${openingTag}\n    ${superTackMetadata}`);
+        });
+        archive.file('Metadata/slice_info.config', sliceInfo);
+        const resolvePlateTemperature = (key, usedFilaments) => {
+            const rawValue = projectConfig[key];
+            const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+            const selectedValues = usedFilaments.length > 0
+                ? usedFilaments
+                    .filter((position) => position < values.length)
+                    .map((position) => values[position])
+                : values;
+            const temperatures = selectedValues
+                .map((value) => Number(value))
+                .filter((value) => Number.isFinite(value) && value > 0);
+            return temperatures.length > 0 ? Math.max(...temperatures) : undefined;
+        };
+        const gcodeEntries = Object.values(archive.files).filter((entry) => !entry.dir && /^Metadata\/plate_\d+\.gcode$/i.test(entry.name));
+        for (const entry of gcodeEntries) {
+            const plateNumber = Number(entry.name.match(/plate_(\d+)\.gcode$/i)?.[1]);
+            const usedFilaments = usedFilamentsByPlate.get(plateNumber) ?? [];
+            const initialTemperature = resolvePlateTemperature('supertack_plate_temp_initial_layer', usedFilaments) ??
+                resolvePlateTemperature('supertack_plate_temp', usedFilaments);
+            const normalTemperature = resolvePlateTemperature('supertack_plate_temp', usedFilaments) ??
+                initialTemperature;
+            if (!initialTemperature || !normalTemperature) {
+                throw new Error(`Selected filament profile does not declare usable SuperTack bed temperatures for plate ${plateNumber}.`);
+            }
+            let gcode = await entry.async('string');
+            gcode = gcode.replace(/^;\s*curr_bed_type\s*=\s*.*$/m, '; curr_bed_type = Bambu Cool Plate SuperTack');
+            let currentLayer = 0;
+            gcode = gcode
+                .split(/\r?\n/)
+                .map((line) => {
+                const layerMatch = line.match(/^;\s*layer num\/total_layer_count:\s*(\d+)\s*\//);
+                if (layerMatch) {
+                    currentLayer = Number(layerMatch[1]);
+                    return line;
+                }
+                const temperatureMatch = line.match(/^(\s*M(?:140|190)\s+S)(-?\d+(?:\.\d+)?)(.*)$/i);
+                if (!temperatureMatch || Number(temperatureMatch[2]) <= 0) {
+                    return line;
+                }
+                const temperature = currentLayer >= 2 ? normalTemperature : initialTemperature;
+                return `${temperatureMatch[1]}${temperature}${temperatureMatch[3]}`;
+            })
+                .join('\n');
+            archive.file(entry.name, gcode);
+            const md5Name = `${entry.name}.md5`;
+            if (archive.file(md5Name)) {
+                const md5 = crypto.createHash('md5').update(Buffer.from(gcode, 'utf8')).digest('hex').toUpperCase();
+                archive.file(md5Name, md5);
+            }
+        }
+        const rewritten = await archive.generateAsync({
+            type: 'nodebuffer',
+            compression: 'DEFLATE',
+            compressionOptions: { level: 6 },
+        });
+        fs.writeFileSync(filePath, rewritten);
+    }
+    async validateBambuSliceArchive(filePath, filamentPaths, bedType) {
+        if (process.env.BAMBU_CLI_VALIDATE_OUTPUT === '0')
+            return;
+        const JSZip = (await import('jszip')).default;
+        const archive = await JSZip.loadAsync(fs.readFileSync(filePath));
+        const projectEntry = archive.file('Metadata/project_settings.config');
+        const gcodeEntries = Object.values(archive.files).filter((entry) => !entry.dir && /^Metadata\/plate_\d+\.gcode$/i.test(entry.name));
+        if (!projectEntry || gcodeEntries.length === 0) {
+            throw new Error('BambuStudio returned an incomplete 3MF without project settings and printable plate G-code.');
+        }
+        const projectConfig = JSON.parse(await projectEntry.async('string'));
+        const actualTypes = Array.isArray(projectConfig.filament_type)
+            ? projectConfig.filament_type.map((value) => String(value).toUpperCase())
+            : [];
+        const actualSettings = Array.isArray(projectConfig.filament_settings_id)
+            ? projectConfig.filament_settings_id.map(String)
+            : [];
+        for (const filamentPath of filamentPaths) {
+            const requested = this.readJsonFile(filamentPath);
+            const requestedType = this.firstProfileValue(requested, 'filament_type')?.toUpperCase();
+            const requestedName = this.firstProfileValue(requested, 'name');
+            if (requestedType && !actualTypes.includes(requestedType)) {
+                throw new Error(`BambuStudio output filament mismatch: requested ${requestedType}, embedded ${actualTypes.join(', ') || 'none'}.`);
+            }
+            if (requestedName && !actualSettings.includes(requestedName)) {
+                throw new Error(`BambuStudio output preset mismatch: requested "${requestedName}", embedded ${JSON.stringify(actualSettings)}.`);
+            }
+        }
+        const requestedBed = bedType
+            ? BAMBU_CLI_BED_TYPES[bedType.trim().toLowerCase()] || bedType
+            : undefined;
+        if (requestedBed && projectConfig.curr_bed_type !== requestedBed) {
+            throw new Error(`BambuStudio output bed mismatch: requested "${requestedBed}", embedded "${projectConfig.curr_bed_type ?? 'unknown'}".`);
+        }
+        if (requestedBed === BAMBU_CLI_BED_TYPES.supertack_plate) {
+            const sliceInfoEntry = archive.file('Metadata/slice_info.config');
+            if (!sliceInfoEntry) {
+                throw new Error('BambuStudio output bed mismatch: SuperTack output is missing Metadata/slice_info.config.');
+            }
+            const sliceInfo = await sliceInfoEntry.async('string');
+            const plateBlocks = sliceInfo.match(/<plate\b[^>]*>[\s\S]*?<\/plate>/gi) ?? [];
+            const inconsistentPlate = plateBlocks.find((plateBlock) => {
+                const metadata = plateBlock.match(/<metadata\b(?=[^>]*\bkey="curr_bed_type")[^>]*\/>/i)?.[0];
+                const value = metadata?.match(/\bvalue="([^"]*)"/i)?.[1];
+                return value !== requestedBed;
+            });
+            if (plateBlocks.length === 0 || inconsistentPlate) {
+                throw new Error('BambuStudio output bed mismatch: every slice_info plate must identify Bambu Cool Plate SuperTack.');
+            }
+        }
     }
     /** Read a profile JSON's top-level `name` field, or null if unreadable. */
     readLeafName(filePath) {
@@ -1131,6 +1325,7 @@ export class STLManipulator extends EventEmitter {
             // Allow proceeding without profile, slicer might handle it
         }
         let args = [];
+        let bambuOutputValidation;
         try {
             if (progressCallback)
                 progressCallback(0, `Starting slicing with ${slicerType}...`);
@@ -1178,6 +1373,12 @@ export class STLManipulator extends EventEmitter {
                         const settingsBundle = slicerType === 'bambustudio'
                             ? await this.maybeFlattenBundle(rawBundle, bambuOptions, slicerPath)
                             : rawBundle;
+                        bambuOutputValidation = {
+                            filamentPaths: settingsBundle.filamentPaths,
+                            bedType: bambuOptions?.bedType,
+                            rewriteSuperTack: slicerType === 'bambustudio' &&
+                                bambuOptions?.bedType?.trim().toLowerCase() === 'supertack_plate',
+                        };
                         args = [
                             '--slice', String(bambuOptions?.slicePlate ?? 0),
                             '--outputdir', outputDir,
@@ -1292,6 +1493,12 @@ export class STLManipulator extends EventEmitter {
             }
             if (!fs.existsSync(outputFilePath)) {
                 throw new Error(redactDiagnostic(`Slicer finished but output file not found: ${outputFilePath}`));
+            }
+            if (bambuOutputValidation?.rewriteSuperTack) {
+                await this.rewriteSuperTackSliceArchive(outputFilePath);
+            }
+            if (bambuOutputValidation) {
+                await this.validateBambuSliceArchive(outputFilePath, bambuOutputValidation.filamentPaths, bambuOutputValidation.bedType);
             }
             if (progressCallback)
                 progressCallback(100, "Slicing completed successfully");

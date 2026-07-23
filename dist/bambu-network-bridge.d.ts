@@ -29,6 +29,7 @@ export type BambuNetworkBridgeStatus = {
     note?: string;
 };
 export declare function defaultBambuNetworkConfigDir(): string;
+export declare function redactBambuNetworkDiagnostic(message: string): string;
 export declare class BambuNetworkBridge {
     private child?;
     private commandLine?;

@@ -62,7 +62,7 @@ type BambuModel = typeof VALID_BAMBU_MODELS[number];
 const H2_BAMBU_MODELS = new Set<string>(["h2d", "h2s", "h2c"]);
 
 const VALID_BED_TYPES = ["textured_plate", "cool_plate", "engineering_plate", "hot_plate", "supertack_plate"] as const;
-const VALID_BAMBUSTUDIO_CLI_BED_TYPES = ["textured_plate", "cool_plate", "engineering_plate", "hot_plate"] as const;
+const VALID_BAMBUSTUDIO_CLI_BED_TYPES = [...VALID_BED_TYPES] as const;
 
 // Map model IDs to BambuStudio --load-machine preset names
 const BAMBU_MODEL_PRESETS: Record<string, (nozzle: string) => string> = {
@@ -531,7 +531,7 @@ function resolveBambuStudioCliBedType(argsBedType: string | undefined): string {
   const bedType = resolveBedType(argsBedType);
   if (!(VALID_BAMBUSTUDIO_CLI_BED_TYPES as readonly string[]).includes(bedType)) {
     throw new Error(
-      `BambuStudio CLI bed_type "${bedType}" is not verified. Use a pre-sliced 3MF for SuperTack, or choose one of: ${VALID_BAMBUSTUDIO_CLI_BED_TYPES.join(", ")}`
+      `Unsupported BambuStudio CLI bed_type "${bedType}". Choose one of: ${VALID_BAMBUSTUDIO_CLI_BED_TYPES.join(", ")}`
     );
   }
   return bedType;
@@ -1039,6 +1039,10 @@ const PRINTER_CONTEXT_TOOLS = new Set([
   "pause_print",
   "resume_print",
   "clear_hms_errors",
+  "reset_ams",
+  "load_ams_filament",
+  "unload_ams_filament",
+  "reboot_printer",
   "set_print_speed",
   "set_airduct_mode",
   "reread_ams_rfid",
@@ -1330,12 +1334,6 @@ class BambuPrinterMCPServer {
 
     if (hasGcode) {
       return { threeMFPath, autoSliced: false };
-    }
-
-    if (bedType === "supertack_plate") {
-      throw new Error(
-        'BambuStudio CLI SuperTack bed type is not verified; use a pre-sliced 3MF for SuperTack or choose textured_plate, cool_plate, engineering_plate, or hot_plate.'
-      );
     }
 
     console.log(`3MF has no gcode - auto-slicing with ${slicerType} for ${printModel}`);
@@ -2170,7 +2168,7 @@ class BambuPrinterMCPServer {
                 bed_type: {
                   type: "string",
                   enum: ["textured_plate", "cool_plate", "engineering_plate", "hot_plate", "supertack_plate"],
-                  description: "Bed plate type for slicing (default: textured_plate). SuperTack is accepted only for pre-sliced print jobs until the BambuStudio CLI identifier is verified."
+                  description: "Bed plate type for slicing (default: textured_plate). SuperTack maps to BambuStudio's Cool Plate SuperTack profile."
                 },
                 use_printer_filaments: { type: "boolean", description: "When true, and no explicit slicer profile or load_filaments override is provided, use the printer's current or first loaded AMS filament as the slicer filament profile." },
                 host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
@@ -2219,7 +2217,7 @@ class BambuPrinterMCPServer {
                 bed_type: {
                   type: "string",
                   enum: ["textured_plate", "cool_plate", "engineering_plate", "hot_plate", "supertack_plate"],
-                  description: "Bed plate type for slicing (default: textured_plate). SuperTack is accepted only for pre-sliced print jobs until the BambuStudio CLI identifier is verified."
+                  description: "Bed plate type for slicing (default: textured_plate). SuperTack uses a validated CLI fallback and is restored in the completed 3MF."
                 },
                 use_printer_filaments: { type: "boolean", description: "When true, and no explicit slicer profile or load_filaments override is provided, use the printer's current or first loaded AMS filament as the slicer filament profile. Template 3MF process settings can still be used at the same time." },
                 uptodate: { type: "boolean", description: "Refresh 3MF preset configs to match the latest BambuStudio version. Use when slicing downloaded or older 3MF files to prevent stale-config failures." },
@@ -2501,6 +2499,63 @@ class BambuPrinterMCPServer {
           {
             name: "clear_hms_errors",
             description: "Clear HMS or print error state on the Bambu Lab printer using the clean_print_error MQTT command.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              }
+            }
+          },
+          {
+            name: "reset_ams",
+            description: "Reset and resume an incomplete AMS load or unload operation while the printer is idle. This can move filament.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              }
+            }
+          },
+          {
+            name: "load_ams_filament",
+            description: "Load filament from an absolute AMS tray while the printer is idle. This heats the nozzle and moves filament.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                slot: {
+                  type: "number",
+                  description: "Absolute AMS tray index from 0 to 15. AMS 0 uses slots 0 to 3."
+                },
+                target_temperature: {
+                  type: "number",
+                  description: "Nozzle temperature for loading, from 170 to 300 degrees Celsius."
+                },
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              },
+              required: ["slot", "target_temperature"]
+            }
+          },
+          {
+            name: "unload_ams_filament",
+            description: "Complete an AMS filament unload while the printer is idle. This can heat the nozzle and move filament.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
+                bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
+                bambu_token: { type: "string", description: "Access token (default: value from env)" }
+              }
+            }
+          },
+          {
+            name: "reboot_printer",
+            description: "Reboot an idle Bambu Lab printer. The printer will temporarily disconnect and active prints are rejected.",
             inputSchema: {
               type: "object",
               properties: {
@@ -3201,6 +3256,31 @@ class BambuPrinterMCPServer {
             result = await this.bambu.clearHmsErrors(host, bambuSerial, bambuToken);
             break;
 
+          case "reset_ams":
+            result = await this.bambu.resetAms(host, bambuSerial, bambuToken);
+            break;
+
+          case "load_ams_filament":
+            if (args?.slot === undefined || args?.target_temperature === undefined) {
+              throw new Error("Missing required parameters: slot and target_temperature");
+            }
+            result = await this.bambu.loadAmsFilament(
+              host,
+              bambuSerial,
+              bambuToken,
+              Number(args.slot),
+              Number(args.target_temperature)
+            );
+            break;
+
+          case "unload_ams_filament":
+            result = await this.bambu.unloadAmsFilament(host, bambuSerial, bambuToken);
+            break;
+
+          case "reboot_printer":
+            result = await this.bambu.rebootPrinter(host, bambuSerial, bambuToken);
+            break;
+
           case "set_print_speed":
             if (!args?.mode) {
               throw new Error("Missing required parameter: mode");
@@ -3550,11 +3630,6 @@ class BambuPrinterMCPServer {
                 f => f.match(/Metadata\/plate_\d+\.gcode/i) || f.endsWith('.gcode')
               );
               if (!hasGcode) {
-                if (printBedType === "supertack_plate") {
-                  throw new Error(
-                    'BambuStudio CLI SuperTack bed type is not verified; use a pre-sliced 3MF for SuperTack or choose textured_plate, cool_plate, engineering_plate, or hot_plate.'
-                  );
-                }
                 console.log(`3MF has no gcode — auto-slicing with ${slicerType} for ${printModel}`);
                 const autoSliceOptions: BambuSliceOptions = {
                   uptodate: true,
@@ -3588,10 +3663,9 @@ class BambuPrinterMCPServer {
                 console.log("Auto-sliced to: " + threeMFPath);
               }
             } catch (sliceCheckErr: any) {
-              if (String(sliceCheckErr?.message || "").includes("SuperTack")) {
-                throw sliceCheckErr;
-              }
-              console.warn("Could not check/slice 3MF, proceeding with original:", sliceCheckErr.message);
+              throw new Error(
+                `Could not validate or auto-slice the 3MF: ${sliceCheckErr?.message ?? sliceCheckErr}`
+              );
             }
 
             const parsed3MFData = await parse3MF(threeMFPath);
@@ -3696,7 +3770,6 @@ class BambuPrinterMCPServer {
               layerInspect: args?.layer_inspect !== undefined ? Boolean(args.layer_inspect) : undefined,
               timelapse: args?.timelapse !== undefined ? Boolean(args.timelapse) : undefined,
             });
-            result = `Print command for ${threeMfFilename} sent successfully.`;
             break;
           }
 

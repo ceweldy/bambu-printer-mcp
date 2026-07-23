@@ -122,6 +122,13 @@ function assertBridgeOk(value: unknown, method: string): void {
   }
 }
 
+export function redactBambuNetworkDiagnostic(message: string): string {
+  return message.replace(/\[PJBRIDGE\][^\r\n]*/g, (line) => {
+    const kind = line.match(/"kind":"([^"]+)"/)?.[1] || "diagnostic";
+    return `[PJBRIDGE] {"kind":"${kind}","payload":"[redacted]"}`;
+  });
+}
+
 export class BambuNetworkBridge {
   private child?: ChildProcessWithoutNullStreams;
   private commandLine?: string;
@@ -317,6 +324,16 @@ export class BambuNetworkBridge {
     await withAgent("net.set_config_dir", { config_dir: configDir });
     await withAgent("net.init_log");
     await withAgent("net.set_country_code", { country_code: countryCode });
+    await withAgent("net.set_queue_on_main_fn");
+    await withAgent("net.set_on_printer_connected_fn", {}, false);
+    await withAgent("net.set_on_server_connected_fn", {}, false);
+    await withAgent("net.set_on_http_error_fn", {}, false);
+    await withAgent("net.set_on_subscribe_failure_fn", {}, false);
+    await withAgent("net.set_on_message_fn", {}, false);
+    await withAgent("net.set_on_user_message_fn", {}, false);
+    await withAgent("net.set_on_local_connect_fn", {}, false);
+    await withAgent("net.set_on_local_message_fn", {}, false);
+    await withAgent("net.set_server_callback", {}, false);
     await withAgent("net.start");
     await withAgent("net.connect_server", {}, false);
 
@@ -481,7 +498,7 @@ export class BambuNetworkBridge {
   private rememberLog(message: string): void {
     const trimmed = message.trim();
     if (!trimmed) return;
-    this.recentLogs.push(trimmed);
+    this.recentLogs.push(redactBambuNetworkDiagnostic(trimmed));
     if (this.recentLogs.length > 25) {
       this.recentLogs = this.recentLogs.slice(-25);
     }
@@ -489,7 +506,8 @@ export class BambuNetworkBridge {
 
   private rememberStderr(message: string): void {
     const combined = `${this.lastStderr}${message}`;
-    this.lastStderr = combined.length > 4000 ? combined.slice(-4000) : combined;
+    const sanitized = redactBambuNetworkDiagnostic(combined);
+    this.lastStderr = sanitized.length > 4000 ? sanitized.slice(-4000) : sanitized;
   }
 
   private rejectAllPending(error: Error): void {

@@ -79,6 +79,26 @@ type NameIndex = Map<string, IndexedProfile>;
 /* Indexing                                                                    */
 /* -------------------------------------------------------------------------- */
 
+async function listJsonFilesRecursively(dir: string): Promise<string[]> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const files: string[] = [];
+  for (const entry of entries) {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await listJsonFilesRecursively(entryPath)));
+    } else if (entry.isFile() && entry.name.endsWith(".json")) {
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
+
 /**
  * Build a name -> {filePath, data} map for every JSON in
  * <profilesRoot>/<vendor>/{machine,process,filament}/.
@@ -97,17 +117,7 @@ async function buildNameIndex(
 
   for (const sub of subdirs) {
     const dir = path.join(profilesRoot, vendor, sub);
-    let entries: string[];
-    try {
-      entries = await fs.readdir(dir);
-    } catch {
-      // Vendor or subdir missing -- skip silently; flatten will fail later
-      // with a precise "name not found" error.
-      continue;
-    }
-    for (const entry of entries) {
-      if (!entry.endsWith(".json")) continue;
-      const filePath = path.join(dir, entry);
+    for (const filePath of await listJsonFilesRecursively(dir)) {
       let raw: string;
       try {
         raw = await fs.readFile(filePath, "utf8");
@@ -418,8 +428,13 @@ function normalizeForCli(
   // _condition fields can stay null (string-typed, tolerated as null).
 }
 
-function applyBedType(processFlat: Record<string, unknown>, bedType?: string): void {
+function applyBedType(
+  machineFlat: Record<string, unknown>,
+  processFlat: Record<string, unknown>,
+  bedType?: string
+): void {
   if (!bedType) return;
+  machineFlat.default_bed_type = bedType;
   processFlat.curr_bed_type = bedType;
 }
 
@@ -485,7 +500,7 @@ export async function flattenForCli(opts: FlattenOptions): Promise<FlattenedProf
   normalizeForCli(machineFlat, "machine", opts.machineLeaf);
   normalizeForCli(processFlat, "process", opts.processLeaf);
   filamentFlats.forEach((f, i) => normalizeForCli(f, "filament", opts.filamentLeaves[i]));
-  applyBedType(processFlat, opts.bedType);
+  applyBedType(machineFlat, processFlat, opts.bedType);
 
   // Mirror the GUI's auto-extend behavior: when the caller explicitly
   // chose a process or filament that wasn't pre-declared compatible with

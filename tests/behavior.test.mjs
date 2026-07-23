@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  verify as verifySignature,
+} from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs";
@@ -16,7 +20,13 @@ import { BambuClient } from "bambu-node";
 import JSZip from "jszip";
 import { hasAmsMappingInput, normalizeAmsMappingObject } from "../dist/ams-mapping.js";
 import { analyze3MFAmsRequirements, analyze3MFPlateObjects } from "../dist/3mf_parser.js";
-import { BambuImplementation } from "../dist/printers/bambu.js";
+import {
+  BambuImplementation,
+  canonicalJson,
+  createSignedPrintEnvelope,
+  requiresEncryptedGcodeLine,
+} from "../dist/printers/bambu.js";
+import { redactBambuNetworkDiagnostic } from "../dist/bambu-network-bridge.js";
 import { redactPrinterConnectionError } from "../dist/redaction.js";
 import { STLManipulator } from "../dist/stl/stl-manipulator.js";
 
@@ -111,6 +121,63 @@ async function closeTransport(transport) {
   try { await transport.close(); } catch { }
 }
 
+test("signed print envelopes use canonical RSA-SHA256 payloads", () => {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
+  const payload = {
+    print: {
+      sequence_id: "42",
+      command: "project_file",
+      nested: { z: 1, a: 2 },
+      ams_mapping: [-1, -1, -1, -1, 3],
+    },
+  };
+  const certId = "00112233445566778899aabbccddeeffCN=TEST.bambulab.com";
+
+  const envelope = createSignedPrintEnvelope(payload, privateKey, certId);
+  const bytesToSign = Buffer.from(
+    `{"print":${canonicalJson(payload.print)}}`,
+    "utf8"
+  );
+
+  assert.equal(envelope.header.sign_ver, "v1.0");
+  assert.equal(envelope.header.sign_alg, "RSA_SHA256");
+  assert.equal(envelope.header.cert_id, certId);
+  assert.equal(envelope.header.payload_len, bytesToSign.length);
+  assert.equal(
+    verifySignature(
+      "RSA-SHA256",
+      bytesToSign,
+      publicKey,
+      Buffer.from(envelope.header.sign_string, "base64")
+    ),
+    true
+  );
+  assert.equal(payload.header, undefined, "signing must not mutate the caller payload");
+});
+
+test("gcode_line encryption gating is scoped to known signed-firmware printers", () => {
+  const previous = process.env.BAMBU_REQUIRE_ENCRYPTED_GCODE_LINE;
+  try {
+    delete process.env.BAMBU_REQUIRE_ENCRYPTED_GCODE_LINE;
+    assert.equal(requiresEncryptedGcodeLine("01P00TEST"), false);
+    assert.equal(requiresEncryptedGcodeLine("09300TEST"), true);
+    assert.equal(requiresEncryptedGcodeLine("09400TEST"), true);
+
+    process.env.BAMBU_REQUIRE_ENCRYPTED_GCODE_LINE = "1";
+    assert.equal(requiresEncryptedGcodeLine("01P00TEST"), true);
+    process.env.BAMBU_REQUIRE_ENCRYPTED_GCODE_LINE = "0";
+    assert.equal(requiresEncryptedGcodeLine("09300TEST"), false);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.BAMBU_REQUIRE_ENCRYPTED_GCODE_LINE;
+    } else {
+      process.env.BAMBU_REQUIRE_ENCRYPTED_GCODE_LINE = previous;
+    }
+  }
+});
+
 async function terminateChildProcess(childProcess) {
   if (childProcess.exitCode !== null) return;
   childProcess.kill("SIGTERM");
@@ -140,6 +207,10 @@ function assertCommonToolPresence(listToolsResult) {
   assert.ok(names.includes("set_fan_speed"));
   assert.ok(names.includes("set_light"));
   assert.ok(names.includes("clear_hms_errors"));
+  assert.ok(names.includes("reset_ams"));
+  assert.ok(names.includes("load_ams_filament"));
+  assert.ok(names.includes("unload_ams_filament"));
+  assert.ok(names.includes("reboot_printer"));
   assert.ok(names.includes("set_print_speed"));
   assert.ok(names.includes("set_airduct_mode"));
   assert.ok(names.includes("reread_ams_rfid"));
@@ -521,6 +592,258 @@ test("H2 family print_3mf rejects pre-sliced filament jobs without explicit AMS 
   }
 });
 
+test("P1S project_file uses firmware-safe local metadata and waits for acceptance", async () => {
+  const fixturePath = await writeSliced3mfFixture({
+    projectFilamentIds: ["GFSNL08"],
+    projectFilamentColors: ["#161616"],
+    projectFilamentTypes: ["PETG"],
+    plateFilamentIds: [0],
+  });
+  const threeMfPath = fixturePath.replace(/\.gcode\.3mf$/, ".3mf");
+  fs.renameSync(fixturePath, threeMfPath);
+  const bambu = new BambuImplementation();
+  let publishedPayload = null;
+  let messageListener = null;
+
+  bambu.ftpUpload = async () => {};
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "FINISH", subtask_name: "previous.3mf" },
+    on: (event, listener) => {
+      if (event === "message") messageListener = listener;
+    },
+    off: () => {},
+    publish: async (payload) => {
+      publishedPayload = payload;
+      queueMicrotask(() => {
+        messageListener?.("device/test/report", "print", {
+          command: "project_file",
+          sequence_id: payload.print.sequence_id,
+          result: "SUCCESS",
+          reason: "SUCCESS",
+        });
+      });
+    },
+  });
+
+  try {
+    const result = await bambu.print3mf(
+      "127.0.0.1",
+      "01P00TEST0000000",
+      "TEST_TOKEN",
+      {
+        projectName: "p1s-coupon",
+        filePath: threeMfPath,
+        bambuModel: "p1s",
+        plateIndex: 0,
+        useAMS: true,
+        amsSlots: [3],
+        bedType: "supertack_plate",
+      }
+    );
+
+    const expectedFile = path.basename(threeMfPath);
+    assert.equal(result.status, "success");
+    assert.equal(result.acceptance?.result, "SUCCESS");
+    assert.equal(publishedPayload.print.bed_type, "auto");
+    assert.equal(publishedPayload.print.bed_leveling, true);
+    assert.equal(publishedPayload.print.bed_levelling, true);
+    assert.equal(publishedPayload.print.file, expectedFile);
+    assert.equal(publishedPayload.print.subtask_name, expectedFile);
+    assert.equal(publishedPayload.print.plate_idx, 0);
+    assert.deepEqual(publishedPayload.print.ams_mapping, [-1, -1, -1, -1, 3]);
+  } finally {
+    fs.rmSync(threeMfPath, { force: true });
+  }
+});
+
+test("P1S ignores a result-less local project_file echo", async () => {
+  const fixturePath = await writeSliced3mfFixture({ plateFilamentIds: [0] });
+  const threeMfPath = fixturePath.replace(/\.gcode\.3mf$/, ".3mf");
+  fs.renameSync(fixturePath, threeMfPath);
+  const bambu = new BambuImplementation();
+  let messageListener = null;
+
+  bambu.ftpUpload = async () => {};
+  bambu.getPrinter = async () => ({
+    data: {
+      gcode_state: "FAILED",
+      subtask_name: "previous.3mf",
+    },
+    on: (event, listener) => {
+      if (event === "message") messageListener = listener;
+    },
+    off: () => {},
+    publish: async (payload) => {
+      queueMicrotask(() => {
+        messageListener?.("device/test/report", "print", {
+          ...payload.print,
+        });
+        messageListener?.("device/test/report", "print", {
+          command: "project_file",
+          sequence_id: payload.print.sequence_id,
+          result: "SUCCESS",
+          reason: "SUCCESS",
+        });
+      });
+    },
+  });
+
+  try {
+    const result = await bambu.print3mf(
+      "127.0.0.1",
+      "01P00TEST0000000",
+      "TEST_TOKEN",
+      {
+        projectName: "p1s-echo",
+        filePath: threeMfPath,
+        bambuModel: "p1s",
+        plateIndex: 0,
+        useAMS: true,
+        amsSlots: [3],
+      }
+    );
+
+    assert.equal(result.status, "success");
+    assert.equal(result.acceptance?.result, "SUCCESS");
+  } finally {
+    fs.rmSync(threeMfPath, { force: true });
+  }
+});
+
+test("P1S rejects a result-less project_file response with an error code", async () => {
+  const fixturePath = await writeSliced3mfFixture({ plateFilamentIds: [0] });
+  const threeMfPath = fixturePath.replace(/\.gcode\.3mf$/, ".3mf");
+  fs.renameSync(fixturePath, threeMfPath);
+  const bambu = new BambuImplementation();
+  let messageListener = null;
+
+  bambu.ftpUpload = async () => {};
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "FINISH", subtask_name: "previous.3mf" },
+    on: (event, listener) => {
+      if (event === "message") messageListener = listener;
+    },
+    off: () => {},
+    publish: async (payload) => {
+      queueMicrotask(() => {
+        messageListener?.("device/test/report", "print", {
+          command: "project_file",
+          sequence_id: payload.print.sequence_id,
+          err_code: 84033543,
+        });
+      });
+    },
+  });
+
+  try {
+    await assert.rejects(
+      bambu.print3mf("127.0.0.1", "01P00TEST0000000", "TEST_TOKEN", {
+        projectName: "p1s-error-code",
+        filePath: threeMfPath,
+        bambuModel: "p1s",
+        plateIndex: 0,
+        useAMS: true,
+        amsSlots: [3],
+      }),
+      /Printer rejected the project file: 84033543\. MQTT message verification failed\./
+    );
+  } finally {
+    fs.rmSync(threeMfPath, { force: true });
+  }
+});
+
+test("P1S project_file rejects a negative printer acknowledgement", async () => {
+  const fixturePath = await writeSliced3mfFixture({ plateFilamentIds: [0] });
+  const threeMfPath = fixturePath.replace(/\.gcode\.3mf$/, ".3mf");
+  fs.renameSync(fixturePath, threeMfPath);
+  const bambu = new BambuImplementation();
+  let messageListener = null;
+
+  bambu.ftpUpload = async () => {};
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "FINISH", subtask_name: "previous.3mf" },
+    on: (event, listener) => {
+      if (event === "message") messageListener = listener;
+    },
+    off: () => {},
+    publish: async (payload) => {
+      queueMicrotask(() => {
+        messageListener?.("device/test/report", "print", {
+          command: "project_file",
+          sequence_id: payload.print.sequence_id,
+          result: "FAILURE",
+          reason: "INVALID_PROJECT",
+          return_code: "05024007",
+        });
+      });
+    },
+  });
+
+  try {
+    await assert.rejects(
+      bambu.print3mf("127.0.0.1", "01P00TEST0000000", "TEST_TOKEN", {
+        projectName: "bad-coupon",
+        filePath: threeMfPath,
+        bambuModel: "p1s",
+        plateIndex: 0,
+        useAMS: true,
+        amsSlots: [3],
+      }),
+      /Printer rejected the project file: INVALID_PROJECT \/ 05024007\. MQTT message verification failed\./
+    );
+  } finally {
+    fs.rmSync(threeMfPath, { force: true });
+  }
+});
+
+test("P1S does not treat a pre-existing active job as project_file acceptance", async () => {
+  const bambu = new BambuImplementation();
+  const listeners = new Map();
+  let published = false;
+  const printer = {
+    data: {
+      gcode_state: "RUNNING",
+      subtask_name: "same-project.3mf",
+    },
+    on: (event, listener) => listeners.set(event, listener),
+    off: (event) => listeners.delete(event),
+    publish: async () => {
+      published = true;
+    },
+  };
+
+  await assert.rejects(
+    bambu.publishProjectFileAndWait(
+      printer,
+      {
+        print: {
+          command: "project_file",
+          sequence_id: "77",
+        },
+      },
+      "same-project.3mf",
+      20
+    ),
+    /did not acknowledge the project_file command/i
+  );
+  assert.equal(published, true);
+  assert.equal(listeners.size, 0);
+});
+
+test("BambuNetwork diagnostics redact callback payloads before status exposure", () => {
+  const source = [
+    'ordinary bridge status',
+    '[PJBRIDGE] {"kind":"net.change_user","payload":{"user_id":"private-user","callback_marker":"private-marker"}}',
+    '[PJBRIDGE] {"kind":"net.local_task_update","payload":{"dev_id":"private-device"}}',
+  ].join("\n");
+  const redacted = redactBambuNetworkDiagnostic(source);
+
+  assert.match(redacted, /ordinary bridge status/);
+  assert.match(redacted, /"kind":"net\.change_user","payload":"\[redacted\]"/);
+  assert.match(redacted, /"kind":"net\.local_task_update","payload":"\[redacted\]"/);
+  assert.doesNotMatch(redacted, /private-user|private-marker|private-device/);
+});
+
 test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", async () => {
   const threeMfPath = await writeSliced3mfFixture({ plateFilamentIds: [1] });
   const bambu = new BambuImplementation();
@@ -770,6 +1093,155 @@ test("BambuNetwork print rejects invalid ams_slots values before bridge payload"
   const emptyMappingErrorText = emptyMappingResult.content?.[0]?.text || "";
   assert.match(emptyMappingErrorText, /ams_slots\[0\].*integer/i);
   assert.doesNotMatch(emptyMappingErrorText, /BAMBU_NETWORK_BRIDGE_COMMAND|FULU BambuNetwork bridge/i);
+});
+
+test("SuperTack rewrite uses plate filaments and preserves initial versus normal temperatures", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "supertack-rewrite-"));
+  const threeMfPath = path.join(tempRoot, "temperature-transition.3mf");
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+
+  const zip = new JSZip();
+  zip.file(
+    "Metadata/project_settings.config",
+    JSON.stringify({
+      curr_bed_type: "High Temp Plate",
+      supertack_plate_temp_initial_layer: ["0", "75"],
+      supertack_plate_temp: ["0", "70"],
+    })
+  );
+  zip.file(
+    "Metadata/plate_1.json",
+    JSON.stringify({
+      bed_type: "hot_plate",
+      filament_ids: [1],
+    })
+  );
+  zip.file(
+    "Metadata/slice_info.config",
+    [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      "<config>",
+      "  <plate>",
+      '    <metadata key="curr_bed_type" value="High Temp Plate"/>',
+      "  </plate>",
+      "</config>",
+    ].join("\n")
+  );
+  const originalGcode = [
+    "; curr_bed_type = High Temp Plate",
+    "M190 S60 ; initial wait",
+    "; layer num/total_layer_count: 1/3",
+    "M140 S60 ; remain at initial temperature",
+    "; layer num/total_layer_count: 2/3",
+    "M140 S60 ; normal layers",
+    "M140 S0 ; turn off bed",
+    "",
+  ].join("\n");
+  zip.file("Metadata/plate_1.gcode", originalGcode);
+  zip.file(
+    "Metadata/plate_1.gcode.md5",
+    createHash("md5").update(originalGcode).digest("hex")
+  );
+  fs.writeFileSync(threeMfPath, await zip.generateAsync({ type: "nodebuffer" }));
+
+  const manipulator = new STLManipulator(tempRoot);
+  await manipulator.rewriteSuperTackSliceArchive(threeMfPath);
+
+  const rewrittenZip = await JSZip.loadAsync(fs.readFileSync(threeMfPath));
+  const rewrittenGcode = await rewrittenZip
+    .file("Metadata/plate_1.gcode")
+    .async("string");
+  const embeddedMd5 = await rewrittenZip
+    .file("Metadata/plate_1.gcode.md5")
+    .async("string");
+  const plate = JSON.parse(
+    await rewrittenZip.file("Metadata/plate_1.json").async("string")
+  );
+  const project = JSON.parse(
+    await rewrittenZip
+      .file("Metadata/project_settings.config")
+      .async("string")
+  );
+  const sliceInfo = await rewrittenZip
+    .file("Metadata/slice_info.config")
+    .async("string");
+
+  assert.match(rewrittenGcode, /^M190 S75 ; initial wait$/m);
+  assert.match(
+    rewrittenGcode,
+    /^M140 S75 ; remain at initial temperature$/m
+  );
+  assert.match(rewrittenGcode, /^M140 S70 ; normal layers$/m);
+  assert.match(rewrittenGcode, /^M140 S0 ; turn off bed$/m);
+  assert.equal(
+    embeddedMd5.toLowerCase(),
+    createHash("md5").update(rewrittenGcode).digest("hex")
+  );
+  assert.equal(plate.bed_type, "supertack_plate");
+  assert.equal(project.curr_bed_type, "Bambu Cool Plate SuperTack");
+  assert.match(
+    sliceInfo,
+    /<metadata key="curr_bed_type" value="Bambu Cool Plate SuperTack"\/>/
+  );
+});
+
+test("slice archive validation checks every supported Bambu bed type", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bed-validation-"));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const manipulator = new STLManipulator(tempRoot);
+  const bedTypes = {
+    textured_plate: "Textured PEI Plate",
+    cool_plate: "Cool Plate",
+    engineering_plate: "Engineering Plate",
+    hot_plate: "High Temp Plate",
+    supertack_plate: "Bambu Cool Plate SuperTack",
+  };
+
+  for (const [requested, embedded] of Object.entries(bedTypes)) {
+    const validPath = path.join(tempRoot, `${requested}-valid.3mf`);
+    const validZip = new JSZip();
+    validZip.file(
+      "Metadata/project_settings.config",
+      JSON.stringify({ curr_bed_type: embedded })
+    );
+    validZip.file("Metadata/plate_1.gcode", "G1 X0 Y0\n");
+    if (requested === "supertack_plate") {
+      validZip.file(
+        "Metadata/slice_info.config",
+        `<config><plate><metadata key="curr_bed_type" value="${embedded}"/></plate></config>`
+      );
+    }
+    fs.writeFileSync(
+      validPath,
+      await validZip.generateAsync({ type: "nodebuffer" })
+    );
+    await manipulator.validateBambuSliceArchive(validPath, [], requested);
+
+    const invalidPath = path.join(tempRoot, `${requested}-invalid.3mf`);
+    const invalidZip = new JSZip();
+    invalidZip.file(
+      "Metadata/project_settings.config",
+      JSON.stringify({
+        curr_bed_type:
+          requested === "supertack_plate" ? embedded : "Unexpected Plate",
+      })
+    );
+    invalidZip.file("Metadata/plate_1.gcode", "G1 X0 Y0\n");
+    if (requested === "supertack_plate") {
+      invalidZip.file(
+        "Metadata/slice_info.config",
+        '<config><plate><metadata key="curr_bed_type" value="High Temp Plate"/></plate></config>'
+      );
+    }
+    fs.writeFileSync(
+      invalidPath,
+      await invalidZip.generateAsync({ type: "nodebuffer" })
+    );
+    await assert.rejects(
+      manipulator.validateBambuSliceArchive(invalidPath, [], requested),
+      /output bed mismatch/i
+    );
+  }
 });
 
 test("sliceSTL allows slicer executables resolved from PATH", async (t) => {
@@ -1083,6 +1555,185 @@ test("set_ams_drying rejects invalid ams_id values", async () => {
     bambu.setAmsDrying("127.0.0.1", "SERIAL", "TOKEN", "start", -999),
     /must be an integer from 0 to 3/i
   );
+});
+
+test("reset_ams rejects active print states", async () => {
+  const bambu = new BambuImplementation();
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "RUNNING" },
+    publish: async () => {},
+  });
+
+  await assert.rejects(
+    bambu.resetAms("127.0.0.1", "SERIAL", "TOKEN"),
+    /only while the printer is idle/i
+  );
+});
+
+test("reset_ams sends the documented recovery command while idle", async () => {
+  const bambu = new BambuImplementation();
+  const publishPayloads = [];
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "FAILED" },
+    publish: async (payload) => {
+      publishPayloads.push(payload);
+    },
+  });
+
+  const result = await bambu.resetAms("127.0.0.1", "SERIAL", "TOKEN");
+
+  assert.equal(publishPayloads.length, 2);
+  assert.equal(publishPayloads[0]?.print?.command, "ams_control");
+  assert.equal(publishPayloads[0]?.print?.param, "reset");
+  assert.match(String(publishPayloads[0]?.print?.sequence_id), /^\d+$/);
+  assert.equal(publishPayloads[1]?.print?.command, "ams_control");
+  assert.equal(publishPayloads[1]?.print?.param, "resume");
+  assert.match(String(publishPayloads[1]?.print?.sequence_id), /^\d+$/);
+  assert.equal(result.status, "success");
+  assert.match(result.message, /AMS reset and resume commands sent/i);
+});
+
+test("load_ams_filament validates the slot and loading temperature", async () => {
+  const bambu = new BambuImplementation();
+
+  await assert.rejects(
+    bambu.loadAmsFilament("127.0.0.1", "SERIAL", "TOKEN", 3.9, 250),
+    /slot must be an absolute AMS tray index from 0 to 15/i
+  );
+  await assert.rejects(
+    bambu.loadAmsFilament("127.0.0.1", "SERIAL", "TOKEN", 16, 250),
+    /slot must be an absolute AMS tray index from 0 to 15/i
+  );
+  await assert.rejects(
+    bambu.loadAmsFilament("127.0.0.1", "SERIAL", "TOKEN", 3, 301),
+    /target_temperature must be from 170 to 300/i
+  );
+});
+
+test("recovery commands fail closed when printer state is unknown", async () => {
+  const actions = [
+    (bambu) => bambu.resetAms("127.0.0.1", "SERIAL", "TOKEN"),
+    (bambu) =>
+      bambu.loadAmsFilament("127.0.0.1", "SERIAL", "TOKEN", 3, 250),
+    (bambu) => bambu.unloadAmsFilament("127.0.0.1", "SERIAL", "TOKEN"),
+    (bambu) => bambu.rebootPrinter("127.0.0.1", "SERIAL", "TOKEN"),
+  ];
+
+  for (const action of actions) {
+    const bambu = new BambuImplementation();
+    let published = false;
+    bambu.getPrinter = async () => ({
+      data: {},
+      publish: async () => {
+        published = true;
+      },
+    });
+    bambu.printerStore.waitForInitialReport = async () => null;
+
+    await assert.rejects(action(bambu), /current print state is UNKNOWN/i);
+    assert.equal(published, false);
+  }
+});
+
+test("load_ams_filament sends the documented idle AMS change command", async () => {
+  const bambu = new BambuImplementation();
+  let publishPayload = null;
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "FAILED", nozzle_temper: 28.7 },
+    publish: async (payload) => {
+      publishPayload = payload;
+    },
+  });
+
+  const result = await bambu.loadAmsFilament(
+    "127.0.0.1",
+    "SERIAL",
+    "TOKEN",
+    3,
+    250
+  );
+
+  assert.equal(publishPayload?.print?.command, "ams_change_filament");
+  assert.equal(publishPayload?.print?.target, 3);
+  assert.equal(publishPayload?.print?.curr_temp, 28);
+  assert.equal(publishPayload?.print?.tar_temp, 250);
+  assert.match(String(publishPayload?.print?.sequence_id), /^\d+$/);
+  assert.equal(result.status, "success");
+  assert.equal(result.slot, 3);
+  assert.equal(result.target_temperature, 250);
+});
+
+test("unload_ams_filament rejects active print states", async () => {
+  const bambu = new BambuImplementation();
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "PREPARE" },
+    publish: async () => {},
+  });
+
+  await assert.rejects(
+    bambu.unloadAmsFilament("127.0.0.1", "SERIAL", "TOKEN"),
+    /only while the printer is idle/i
+  );
+});
+
+test("unload_ams_filament sends the acknowledged unload command while idle", async () => {
+  const bambu = new BambuImplementation();
+  let publishPayload = null;
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "FAILED" },
+    publish: async (payload) => {
+      publishPayload = payload;
+    },
+  });
+
+  const result = await bambu.unloadAmsFilament(
+    "127.0.0.1",
+    "SERIAL",
+    "TOKEN"
+  );
+
+  assert.equal(publishPayload?.print?.command, "unload_filament");
+  assert.match(String(publishPayload?.print?.sequence_id), /^\d+$/);
+  assert.equal(result.status, "success");
+  assert.match(result.message, /unload command accepted/i);
+});
+
+test("reboot_printer rejects active print states", async () => {
+  const bambu = new BambuImplementation();
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "RUNNING" },
+    publish: async () => {},
+  });
+
+  await assert.rejects(
+    bambu.rebootPrinter("127.0.0.1", "SERIAL", "TOKEN"),
+    /only while.*idle/i
+  );
+});
+
+test("reboot_printer sends the system reboot command while idle", async () => {
+  const bambu = new BambuImplementation();
+  let publishPayload = null;
+  bambu.getPrinter = async () => ({
+    data: { gcode_state: "FAILED" },
+    publish: async (payload) => {
+      publishPayload = payload;
+    },
+  });
+
+  const result = await bambu.rebootPrinter(
+    "127.0.0.1",
+    "SERIAL",
+    "TOKEN"
+  );
+
+  assert.deepEqual(publishPayload, {
+    system: {
+      command: "reboot",
+    },
+  });
+  assert.equal(result.status, "success");
+  assert.match(result.message, /reboot command sent/i);
 });
 
 test("set_ams_drying sends correct MQTT command for start", async () => {
@@ -1427,6 +2078,7 @@ test("slice_with_template prefers named template settings over BAMBU_SLICER_PROF
       BAMBU_SERIAL: "",
       BAMBU_TOKEN: "",
       BAMBU_SLICER_PROFILE: defaultProfilePath,
+      BAMBU_CLI_VALIDATE_OUTPUT: "0",
     },
     stderr: "pipe",
   });
@@ -1474,6 +2126,7 @@ test("template_name resolves by source type for slicer profiles versus 3MF sourc
       BAMBU_MODEL: "p1s",
       BAMBU_SERIAL: "",
       BAMBU_TOKEN: "",
+      BAMBU_CLI_VALIDATE_OUTPUT: "0",
     },
     stderr: "pipe",
   });
