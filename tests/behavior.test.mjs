@@ -26,7 +26,16 @@ import {
   createSignedPrintEnvelope,
   requiresEncryptedGcodeLine,
 } from "../dist/printers/bambu.js";
-import { redactBambuNetworkDiagnostic } from "../dist/bambu-network-bridge.js";
+import {
+  BambuNetworkBridge,
+  createBambuNetworkSubmissionNames,
+  isBambuNetworkControlMethod,
+  isManagedBambuNetworkCallMethod,
+  redactBambuNetworkDiagnostic,
+  requiresBambuNetworkAgentForRawCall,
+  requiresBambuNetworkProjectFileAcknowledgement,
+  stageBambuNetworkCertificates,
+} from "../dist/bambu-network-bridge.js";
 import { redactPrinterConnectionError } from "../dist/redaction.js";
 import { STLManipulator } from "../dist/stl/stl-manipulator.js";
 
@@ -377,6 +386,13 @@ test("printer model safety: schemas accept profile defaults while runtime reject
   assert.ok(networkPrintTool, "print_3mf_bambu_network tool must exist");
   assert.equal(networkPrintTool.inputSchema.required.includes("bambu_model"), false);
   assert.equal(networkPrintTool.inputSchema.properties.plate_index.type, "number");
+  assert.equal(
+    networkPrintTool.inputSchema.properties.bambu_network_method.enum.includes(
+      "start_local_print_with_record"
+    ),
+    false,
+    "unconfirmed local-with-record print must not be exposed"
+  );
 
   // No 'type' param should exist on any tool (Bambu-only)
   for (const tool of listToolsResult.tools) {
@@ -842,6 +858,972 @@ test("BambuNetwork diagnostics redact callback payloads before status exposure",
   assert.match(redacted, /"kind":"net\.change_user","payload":"\[redacted\]"/);
   assert.match(redacted, /"kind":"net\.local_task_update","payload":"\[redacted\]"/);
   assert.doesNotMatch(redacted, /private-user|private-marker|private-device/);
+});
+
+test("BambuNetwork certificate staging requires and copies the complete LAN trust bundle", (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bambu-network-certs-"));
+  const sourceDir = path.join(tempRoot, "source");
+  const configDir = path.join(tempRoot, "config");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  fs.writeFileSync(path.join(sourceDir, "slicer_base64.cer"), "slicer-public-cert");
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+
+  const incomplete = stageBambuNetworkCertificates(configDir, [sourceDir]);
+  assert.equal(incomplete.certDir, undefined);
+  assert.deepEqual(incomplete.missing, ["printer.cer"]);
+
+  fs.writeFileSync(path.join(sourceDir, "printer.cer"), "printer-public-ca-bundle");
+  const complete = stageBambuNetworkCertificates(configDir, [sourceDir]);
+  assert.equal(complete.certDir, path.join(configDir, "cert"));
+  assert.deepEqual(complete.missing, []);
+  assert.equal(
+    fs.readFileSync(path.join(complete.certDir, "printer.cer"), "utf8"),
+    "printer-public-ca-bundle"
+  );
+
+  fs.rmSync(sourceDir, { recursive: true, force: true });
+  const reused = stageBambuNetworkCertificates(configDir, []);
+  assert.equal(reused.certDir, path.join(configDir, "cert"));
+  assert.deepEqual(reused.missing, []);
+
+  const replacementDir = path.join(tempRoot, "replacement");
+  fs.mkdirSync(replacementDir, { recursive: true });
+  fs.writeFileSync(path.join(replacementDir, "slicer_base64.cer"), "new-slicer-certificate");
+  fs.writeFileSync(path.join(replacementDir, "printer.cer"), "new-printer-certificate");
+  const replaced = stageBambuNetworkCertificates(configDir, [replacementDir]);
+  assert.notEqual(replaced.fingerprint, reused.fingerprint);
+  assert.equal(
+    fs.readFileSync(path.join(configDir, "cert", "printer.cer"), "utf8"),
+    "new-printer-certificate"
+  );
+
+  const incompleteReplacementDir = path.join(tempRoot, "incomplete-replacement");
+  fs.mkdirSync(incompleteReplacementDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(incompleteReplacementDir, "slicer_base64.cer"),
+    "incomplete-new-slicer-certificate"
+  );
+  const rejectedReplacement = stageBambuNetworkCertificates(
+    configDir,
+    [incompleteReplacementDir],
+    incompleteReplacementDir
+  );
+  assert.equal(rejectedReplacement.certDir, undefined);
+  assert.deepEqual(rejectedReplacement.missing, ["printer.cer"]);
+  assert.equal(
+    fs.readFileSync(path.join(configDir, "cert", "slicer_base64.cer"), "utf8"),
+    "new-slicer-certificate"
+  );
+  assert.equal(
+    fs.readFileSync(path.join(configDir, "cert", "printer.cer"), "utf8"),
+    "new-printer-certificate"
+  );
+
+  const splitConfigDir = path.join(tempRoot, "split-config");
+  const splitSlicerDir = path.join(tempRoot, "split-slicer");
+  const splitPrinterDir = path.join(tempRoot, "split-printer");
+  fs.mkdirSync(splitSlicerDir, { recursive: true });
+  fs.mkdirSync(splitPrinterDir, { recursive: true });
+  fs.writeFileSync(path.join(splitSlicerDir, "slicer_base64.cer"), "split-slicer");
+  fs.writeFileSync(path.join(splitPrinterDir, "printer.cer"), "split-printer");
+  const rejectedSplit = stageBambuNetworkCertificates(
+    splitConfigDir,
+    [splitSlicerDir, splitPrinterDir]
+  );
+  assert.equal(rejectedSplit.certDir, undefined);
+  assert.deepEqual(rejectedSplit.missing, ["printer.cer"]);
+  assert.equal(fs.existsSync(path.join(splitConfigDir, "cert")), false);
+});
+
+test("BambuNetwork connection reports a dispatched void device-certificate request", async () => {
+  const bridge = new BambuNetworkBridge();
+  bridge.ensureAgent = async () => {
+    bridge.agentCertDir = "/tmp/test-bambu-network-certs";
+    return { agent: 7, handshake: {} };
+  };
+  bridge.request = async (method, payload) => {
+    if (method === "net.connect_printer") {
+      return { ok: true, value: 0 };
+    }
+    if (method === "bridge.poll_events") {
+      return {
+        ok: true,
+        events: [
+          {
+            name: "on_local_connect",
+            payload: { dev_id: "TEST-DEVICE", status: 0 },
+          },
+        ],
+      };
+    }
+    if (method === "net.install_device_cert") {
+      return { ok: true, value: 9 };
+    }
+    throw new Error(`Unexpected bridge method ${method}`);
+  };
+
+  const connected = await bridge.connectPrinter({
+      devId: "TEST-DEVICE",
+      devIp: "192.0.2.10",
+      username: "bblp",
+      accessCode: "test-access-code",
+      useSsl: true,
+    });
+  assert.equal(connected.connected, true);
+  assert.equal(connected.deviceCertificateRequested, true);
+});
+
+test("BambuNetwork agent startup rejects failed certificate initialization", async (t) => {
+  const bridge = new BambuNetworkBridge();
+  let destroyedAgent = null;
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bambu-network-agent-certs-"));
+  const sourceDir = path.join(tempRoot, "source");
+  const configDir = path.join(tempRoot, "config");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  fs.writeFileSync(path.join(sourceDir, "slicer_base64.cer"), "slicer-certificate");
+  fs.writeFileSync(path.join(sourceDir, "printer.cer"), "printer-certificate");
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+
+  bridge.request = async (method, payload) => {
+    if (method === "bridge.handshake") {
+      return { ok: true };
+    }
+    if (method === "net.create_agent") {
+      return { ok: true, value: 7 };
+    }
+    if (method === "net.set_cert_file") {
+      return { ok: true, value: 5 };
+    }
+    if (method === "net.destroy_agent") {
+      destroyedAgent = payload.agent;
+      return { ok: true, value: 0 };
+    }
+    return { ok: true, value: 0 };
+  };
+
+  await assert.rejects(
+    bridge.ensureAgent({
+      bridgeCommand: "test-bridge",
+      configDir,
+      certDir: sourceDir,
+    }),
+    /set_cert_file returned non-zero result 5/i
+  );
+  assert.equal(destroyedAgent, 7);
+});
+
+test("BambuNetwork agent startup rejects an incomplete explicit certificate bundle", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bambu-network-incomplete-explicit-"));
+  const sourceDir = path.join(tempRoot, "source");
+  const configDir = path.join(tempRoot, "config");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  fs.writeFileSync(path.join(sourceDir, "slicer_base64.cer"), "slicer-public-cert");
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+
+  const bridge = new BambuNetworkBridge();
+  bridge.request = async () => {
+    throw new Error("Bridge startup must not run with an incomplete explicit bundle.");
+  };
+
+  await assert.rejects(
+    bridge.ensureAgent({
+      bridgeCommand: "test-bridge",
+      configDir,
+      certDir: sourceDir,
+    }),
+    /explicitly configured.*incomplete.*printer\.cer/i
+  );
+});
+
+test("BambuNetwork runtime directories remain certificate fallbacks", (t) => {
+  const runtimeDir = path.join(os.tmpdir(), `bambu-network-runtime-${Date.now()}`);
+  const explicitDir = path.join(os.tmpdir(), `bambu-network-explicit-${Date.now()}`);
+  const originalPluginDir = process.env.PJARCZAK_BAMBU_PLUGIN_DIR;
+  const originalCertDir = process.env.BAMBU_NETWORK_CERT_DIR;
+  process.env.PJARCZAK_BAMBU_PLUGIN_DIR = runtimeDir;
+  delete process.env.BAMBU_NETWORK_CERT_DIR;
+  t.after(() => {
+    if (originalPluginDir === undefined) {
+      delete process.env.PJARCZAK_BAMBU_PLUGIN_DIR;
+    } else {
+      process.env.PJARCZAK_BAMBU_PLUGIN_DIR = originalPluginDir;
+    }
+    if (originalCertDir === undefined) {
+      delete process.env.BAMBU_NETWORK_CERT_DIR;
+    } else {
+      process.env.BAMBU_NETWORK_CERT_DIR = originalCertDir;
+    }
+  });
+
+  const bridge = new BambuNetworkBridge();
+  const fallbackSources = bridge.resolveCertificateSources({});
+  assert.equal(fallbackSources.strictDirectory, undefined);
+  assert.ok(fallbackSources.directories.includes(runtimeDir));
+
+  process.env.BAMBU_NETWORK_CERT_DIR = explicitDir;
+  const explicitSources = bridge.resolveCertificateSources({});
+  assert.equal(explicitSources.strictDirectory, explicitDir);
+  assert.equal(explicitSources.directories[0], explicitDir);
+});
+
+test("BambuNetwork stops after failed initialization cleanup", async (t) => {
+  const bridge = new BambuNetworkBridge();
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bambu-network-agent-cleanup-"));
+  const sourceDir = path.join(tempRoot, "source");
+  const configDir = path.join(tempRoot, "config");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  fs.writeFileSync(path.join(sourceDir, "slicer_base64.cer"), "slicer-certificate");
+  fs.writeFileSync(path.join(sourceDir, "printer.cer"), "printer-certificate");
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+
+  let stopped = false;
+  bridge.stop = async () => {
+    stopped = true;
+  };
+  bridge.request = async (method) => {
+    if (method === "bridge.handshake") return { ok: true };
+    if (method === "net.create_agent") return { ok: true, value: 7 };
+    if (method === "net.set_cert_file") return { ok: true, value: 5 };
+    if (method === "net.destroy_agent") return { ok: true, value: 9 };
+    return { ok: true, value: 0 };
+  };
+
+  await assert.rejects(
+    bridge.ensureAgent({
+      bridgeCommand: "test-bridge",
+      configDir,
+      certDir: sourceDir,
+    }),
+    /set_cert_file returned non-zero result 5/i
+  );
+  assert.equal(stopped, true);
+});
+
+test("BambuNetwork certificate rotation destroys the previous agent", async (t) => {
+  const bridge = new BambuNetworkBridge();
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bambu-network-agent-rotation-"));
+  const sourceDir = path.join(tempRoot, "source");
+  const configDir = path.join(tempRoot, "config");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  fs.writeFileSync(path.join(sourceDir, "slicer_base64.cer"), "slicer-certificate-v1");
+  fs.writeFileSync(path.join(sourceDir, "printer.cer"), "printer-certificate-v1");
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+
+  let nextAgent = 7;
+  const destroyedAgents = [];
+  bridge.request = async (method, payload) => {
+    if (method === "bridge.handshake") return { ok: true };
+    if (method === "net.create_agent") {
+      return { ok: true, value: nextAgent++ };
+    }
+    if (method === "net.destroy_agent") {
+      destroyedAgents.push(payload.agent);
+      return { ok: true, value: 0 };
+    }
+    return { ok: true, value: 0 };
+  };
+
+  const first = await bridge.ensureAgent({
+    bridgeCommand: "test-bridge",
+    configDir,
+    certDir: sourceDir,
+  });
+  assert.equal(first.agent, 7);
+
+  fs.writeFileSync(path.join(sourceDir, "printer.cer"), "printer-certificate-v2");
+  const second = await bridge.ensureAgent({
+    bridgeCommand: "test-bridge",
+    configDir,
+    certDir: sourceDir,
+  });
+  assert.equal(second.agent, 8);
+  assert.deepEqual(destroyedAgents, [7]);
+});
+
+test("BambuNetwork waits for every local method that publishes project_file", () => {
+  assert.equal(requiresBambuNetworkProjectFileAcknowledgement("start_local_print"), true);
+  assert.equal(
+    requiresBambuNetworkProjectFileAcknowledgement("start_local_print_with_record"),
+    false
+  );
+  assert.equal(requiresBambuNetworkProjectFileAcknowledgement("start_sdcard_print"), true);
+  assert.equal(
+    requiresBambuNetworkProjectFileAcknowledgement("start_send_gcode_to_sdcard"),
+    false
+  );
+  assert.equal(requiresBambuNetworkProjectFileAcknowledgement("start_print"), false);
+});
+
+test("BambuNetwork raw diagnostics cannot bypass managed lifecycle methods", () => {
+  assert.equal(isManagedBambuNetworkCallMethod("net.connect_printer"), true);
+  assert.equal(isManagedBambuNetworkCallMethod("net.set_cert_file"), true);
+  assert.equal(isManagedBambuNetworkCallMethod("net.start_local_print"), true);
+  assert.equal(isManagedBambuNetworkCallMethod("net.start_print"), true);
+  assert.equal(isManagedBambuNetworkCallMethod("net.send_message"), true);
+  assert.equal(isManagedBambuNetworkCallMethod("net.send_message_to_printer"), true);
+  assert.equal(isManagedBambuNetworkCallMethod("bridge.poll_events"), false);
+  assert.equal(isManagedBambuNetworkCallMethod("bridge.job_wait_reply"), false);
+  assert.equal(isManagedBambuNetworkCallMethod("ft.job_cancel"), false);
+  assert.equal(isBambuNetworkControlMethod("bridge.poll_events"), true);
+  assert.equal(isBambuNetworkControlMethod("bridge.job_wait_reply"), true);
+  assert.equal(isBambuNetworkControlMethod("bridge.job_cancel"), true);
+  assert.equal(isBambuNetworkControlMethod("bridge.cancel_job"), false);
+  assert.equal(isBambuNetworkControlMethod("bridge.callback_reply"), true);
+  assert.equal(isBambuNetworkControlMethod("ft.job_cancel"), true);
+  assert.equal(isBambuNetworkControlMethod("net.is_user_login"), false);
+  assert.equal(
+    requiresBambuNetworkAgentForRawCall("bridge.job_wait_reply", undefined),
+    false
+  );
+  assert.equal(
+    requiresBambuNetworkAgentForRawCall("bridge.callback_reply", true),
+    false
+  );
+  assert.equal(
+    requiresBambuNetworkAgentForRawCall("net.is_user_login", undefined),
+    true
+  );
+  assert.equal(
+    requiresBambuNetworkAgentForRawCall("net.is_user_login", false),
+    false
+  );
+});
+
+test("BambuNetwork submission names use a server-generated unique marker", () => {
+  const first = createBambuNetworkSubmissionNames("holder-v2", "desk-holder");
+  const second = createBambuNetworkSubmissionNames("holder-v2", "desk-holder");
+
+  assert.match(first.projectName, /^holder-v2__mcp_[0-9a-f]{12}$/);
+  assert.match(first.taskName, /^desk-holder__mcp_[0-9a-f]{12}$/);
+  assert.notEqual(first.nonce, second.nonce);
+  assert.notEqual(first.projectName, second.projectName);
+  assert.notEqual(first.taskName, second.taskName);
+
+  const bounded = createBambuNetworkSubmissionNames("x".repeat(200));
+  assert.equal(bounded.projectName.length, 96);
+  assert.equal(Buffer.byteLength(bounded.projectName, "utf8"), 96);
+  assert.match(bounded.projectName, /__mcp_[0-9a-f]{12}$/);
+
+  const unicodeBounded = createBambuNetworkSubmissionNames(
+    `${"é".repeat(40)}${"😀".repeat(20)}`
+  );
+  assert.ok(Buffer.byteLength(unicodeBounded.projectName, "utf8") <= 96);
+  assert.equal(
+    Buffer.from(unicodeBounded.projectName, "utf8").toString("utf8"),
+    unicodeBounded.projectName
+  );
+  assert.doesNotMatch(unicodeBounded.projectName, /[\uD800-\uDFFF]/);
+  assert.match(unicodeBounded.projectName, /__mcp_[0-9a-f]{12}$/);
+});
+
+test("BambuNetwork sequence correlation requires an explicit host capability", () => {
+  const bridge = new BambuNetworkBridge();
+  bridge.handshake = { network_loaded: true };
+  assert.equal(bridge.supportsProjectFileSequenceCorrelation(), false);
+  bridge.handshake = {
+    network_loaded: true,
+    project_file_sequence_id: true,
+  };
+  assert.equal(bridge.supportsProjectFileSequenceCorrelation(), true);
+});
+
+test("BambuNetwork acknowledgement ignores result-less responses", async () => {
+  const bridge = new BambuNetworkBridge();
+  const acceptedSequenceId = 23;
+  let requestCount = 0;
+  bridge.request = async (method) => {
+    assert.equal(method, "bridge.poll_events");
+    requestCount += 1;
+    return {
+      ok: true,
+      events:
+        requestCount === 1
+          ? [
+              {
+                name: "job.wait",
+                payload: { job_id: 7, request_id: 8 },
+              },
+              {
+                name: "on_local_message",
+                payload: {
+                  dev_id: "TEST-DEVICE",
+                  msg: JSON.stringify({
+                    print: {
+                      command: "project_file",
+                      sequence_id: String(acceptedSequenceId),
+                    },
+                  }),
+                },
+              },
+            ]
+          : [
+              {
+                name: "on_local_message",
+                payload: {
+                  dev_id: "TEST-DEVICE",
+                  msg: JSON.stringify({
+                    print: {
+                      command: "project_file",
+                      result: "success",
+                      sequence_id: String(acceptedSequenceId),
+                    },
+                  }),
+                },
+              },
+            ],
+    };
+  };
+
+  const acknowledgementPromise = bridge.waitForLocalPrintAcknowledgement(
+    "TEST-DEVICE",
+    String(acceptedSequenceId)
+  );
+  await sleep(20);
+  const control = await bridge.pollEventsForControl({ limit: 64 });
+  assert.equal(control.events[0]?.name, "job.wait");
+  const acknowledgement = await acknowledgementPromise;
+  assert.equal(requestCount, 2);
+  assert.deepEqual(acknowledgement, {
+    errCode: 0,
+    command: "project_file",
+    sequenceId: String(acceptedSequenceId),
+  });
+});
+
+test("BambuNetwork control polling preserves managed print messages", async () => {
+  const bridge = new BambuNetworkBridge();
+  let requests = 0;
+  bridge.request = async (method) => {
+    requests += 1;
+    assert.equal(method, "bridge.poll_events");
+    return {
+      ok: true,
+      events: [
+        {
+          name: "job.wait",
+          payload: { job_id: 7, request_id: 8 },
+        },
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: {
+                command: "project_file",
+                sequence_id: "42",
+                result: "success",
+              },
+            }),
+          },
+        },
+      ],
+    };
+  };
+
+  const controlPoll = await bridge.pollEventsForControl({ limit: 64 });
+  assert.equal(controlPoll.events.length, 2);
+  const acknowledgement = await bridge.waitForLocalPrintAcknowledgement(
+    "TEST-DEVICE",
+    "42"
+  );
+  assert.equal(requests, 1);
+  assert.equal(acknowledgement.sequenceId, "42");
+});
+
+test("BambuNetwork control calls stay bound to the active bridge command", async () => {
+  const bridge = new BambuNetworkBridge();
+  const activeChild = { exitCode: null };
+  bridge.child = activeChild;
+  bridge.commandLine = "active-bridge";
+  let receivedOptions;
+  bridge.request = async (_method, _payload, options) => {
+    receivedOptions = options;
+    return { ok: true, value: 0 };
+  };
+
+  await bridge.requestControl("bridge.job_wait_reply", {
+    job_id: 7,
+    request_id: 8,
+    reply: true,
+  });
+  assert.equal(receivedOptions.bridgeCommand, "active-bridge");
+
+  await assert.rejects(
+    bridge.requestControl(
+      "bridge.job_cancel",
+      { job_id: 7, cancel: true },
+      { bridgeCommand: "different-bridge" }
+    ),
+    /cannot switch bridge_command/i
+  );
+});
+
+test("BambuNetwork control polling preserves managed connection callbacks", async () => {
+  const bridge = new BambuNetworkBridge();
+  bridge.ensureAgent = async () => ({ agent: 1, handshake: {} });
+  bridge.discardQueuedEvents = async () => 0;
+  bridge.request = async (method) => {
+    if (method === "bridge.poll_events") {
+      return {
+        ok: true,
+        events: [
+          {
+            name: "on_local_connect",
+            payload: { dev_id: "TEST-DEVICE", status: 0 },
+          },
+        ],
+      };
+    }
+    if (method === "net.connect_printer") {
+      return { ok: true, value: 0 };
+    }
+    if (method === "net.install_device_cert") {
+      return { ok: true };
+    }
+    throw new Error(`Unexpected bridge method ${method}`);
+  };
+
+  await bridge.pollEventsForControl({ limit: 64 });
+  const connected = await bridge.connectPrinter({
+    devId: "TEST-DEVICE",
+    devIp: "127.0.0.1",
+    username: "bblp",
+    accessCode: "TEST_TOKEN",
+    useSsl: false,
+  });
+  assert.equal(connected.connected, true);
+  assert.equal(connected.deviceCertificateRequested, true);
+});
+
+test("BambuNetwork preserves push_status delivered with the acknowledgement", async () => {
+  const bridge = new BambuNetworkBridge();
+  let requests = 0;
+  bridge.request = async () => {
+    requests += 1;
+    if (requests > 1) {
+      throw new Error("The preserved push_status event should satisfy confirmation.");
+    }
+    return {
+      ok: true,
+      events: [
+        {
+          name: "job.wait",
+          payload: { job_id: 7, request_id: 8 },
+        },
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: {
+                command: "push_status",
+                gcode_state: "PREPARE",
+                subtask_name: "holder-v2__mcp_42",
+              },
+            }),
+          },
+        },
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: {
+                command: "project_file",
+                result: "success",
+                sequence_id: "42",
+              },
+            }),
+          },
+        },
+      ],
+    };
+  };
+
+  await bridge.waitForLocalPrintAcknowledgement("TEST-DEVICE", "42");
+  const job = await bridge.waitForPrinterJobStart(
+    "TEST-DEVICE",
+    ["holder-v2__mcp_42"]
+  );
+  assert.deepEqual(job, {
+    state: "PREPARE",
+    filename: "holder-v2__mcp_42",
+  });
+  const control = await bridge.pollEventsForControl({ limit: 64 });
+  assert.ok(
+    control.events.some(
+      (event) =>
+        event?.name === "job.wait" &&
+        event?.payload?.job_id === 7 &&
+        event?.payload?.request_id === 8
+    ),
+    "the acknowledgement and job-start waiters must preserve control events"
+  );
+});
+
+test("BambuNetwork acknowledgement never treats a result-less response as success", async () => {
+  const bridge = new BambuNetworkBridge();
+  bridge.request = async (method) => {
+    assert.equal(method, "bridge.poll_events");
+    return {
+      ok: true,
+      events: [
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: {
+                command: "project_file",
+                sequence_id: "41",
+              },
+            }),
+          },
+        },
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: {
+                command: "project_file",
+                sequence_id: "42",
+                err_code: 84033543,
+              },
+            }),
+          },
+        },
+      ],
+    };
+  };
+
+  await assert.rejects(
+    bridge.waitForLocalPrintAcknowledgement("TEST-DEVICE", "42"),
+    /84033543.*verification failed/i
+  );
+});
+
+test("BambuNetwork acknowledgement ignores stale project_file responses", async () => {
+  const bridge = new BambuNetworkBridge();
+  bridge.request = async () => ({
+    ok: true,
+    events: [
+      {
+        name: "on_local_message",
+        payload: {
+          dev_id: "TEST-DEVICE",
+          msg: JSON.stringify({
+            print: {
+              command: "project_file",
+              sequence_id: "41",
+              err_code: 84033543,
+            },
+          }),
+        },
+      },
+      {
+        name: "on_local_message",
+        payload: {
+          dev_id: "TEST-DEVICE",
+          msg: JSON.stringify({
+            print: {
+              command: "project_file",
+              sequence_id: "42",
+              result: "success",
+            },
+          }),
+        },
+      },
+    ],
+  });
+
+  const acknowledgement = await bridge.waitForLocalPrintAcknowledgement(
+    "TEST-DEVICE",
+    "42"
+  );
+  assert.deepEqual(acknowledgement, {
+    errCode: 0,
+    command: "project_file",
+    sequenceId: "42",
+  });
+});
+
+test("BambuNetwork bridge lifecycles are serialized", async () => {
+  const bridge = new BambuNetworkBridge();
+  const order = [];
+  const first = bridge.withExclusiveLifecycle(async () => {
+    order.push("first-start");
+    await sleep(20);
+    order.push("first-end");
+  });
+  const second = bridge.withExclusiveLifecycle(async () => {
+    order.push("second-start");
+    order.push("second-end");
+  });
+
+  await Promise.all([first, second]);
+  assert.deepEqual(order, [
+    "first-start",
+    "first-end",
+    "second-start",
+    "second-end",
+  ]);
+});
+
+test("BambuNetwork managed print lifecycle keeps the raw control lane open", async () => {
+  const bridge = new BambuNetworkBridge();
+  let release;
+  const active = bridge.withExclusiveLifecycle(
+    async () =>
+      await new Promise((resolve) => {
+        release = resolve;
+      }),
+    { allowRawControl: true }
+  );
+
+  await sleep(0);
+  assert.equal(bridge.isRawControlLaneOpen(), true);
+  release();
+  await active;
+  assert.equal(bridge.isRawControlLaneOpen(), false);
+});
+
+test("BambuNetwork success requires the exact live printer job", async () => {
+  const bridge = new BambuNetworkBridge();
+  bridge.request = async () => ({
+    ok: true,
+    events: [
+      {
+        name: "on_local_message",
+        payload: {
+          dev_id: "TEST-DEVICE",
+          msg: JSON.stringify({
+            print: {
+              command: "push_status",
+              gcode_state: "RUNNING",
+              subtask_name: "holder-v2",
+            },
+          }),
+        },
+      },
+    ],
+  });
+  const confirmed = await bridge.waitForPrinterJobStart(
+    "TEST-DEVICE",
+    ["holder-v2.3mf"],
+    { timeoutMs: 1_000 }
+  );
+  assert.deepEqual(confirmed, { state: "RUNNING", filename: "holder-v2" });
+
+  const unrelatedBridge = new BambuNetworkBridge();
+  let requestCount = 0;
+  unrelatedBridge.request = async () => {
+    requestCount += 1;
+    return {
+      ok: true,
+      events: [
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: {
+                command: "push_status",
+                gcode_state: "RUNNING",
+                subtask_name:
+                  requestCount === 1 ? "different-job" : "holder-v2",
+              },
+            }),
+          },
+        },
+      ],
+    };
+  };
+  const confirmedAfterUnrelated = await unrelatedBridge.waitForPrinterJobStart(
+    "TEST-DEVICE",
+    ["holder-v2.3mf"],
+    { confirmationTimeoutMs: 1_000 }
+  );
+  assert.equal(requestCount, 2);
+  assert.deepEqual(confirmedAfterUnrelated, {
+    state: "RUNNING",
+    filename: "holder-v2",
+  });
+});
+
+test("BambuNetwork waits through sparse active push_status reports", async () => {
+  const bridge = new BambuNetworkBridge();
+  let requestCount = 0;
+  bridge.request = async () => {
+    requestCount += 1;
+    return {
+      ok: true,
+      events: [
+        ...(requestCount === 1
+          ? [
+              {
+                name: "job.wait",
+                payload: { job_id: 9, request_id: 10 },
+              },
+            ]
+          : []),
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: requestCount === 1
+                ? {
+                    command: "push_status",
+                    gcode_state: "IDLE",
+                    subtask_name: "holder-v2__mcp_42",
+                  }
+                : {
+                    command: "push_status",
+                    gcode_state: "PREPARE",
+                  },
+            }),
+          },
+        },
+      ],
+    };
+  };
+
+  const confirmationPromise = bridge.waitForPrinterJobStart(
+    "TEST-DEVICE",
+    ["holder-v2__mcp_42"],
+    { confirmationTimeoutMs: 1_000 }
+  );
+  await sleep(20);
+  const control = await bridge.pollEventsForControl({ limit: 64 });
+  assert.equal(control.events[0]?.name, "job.wait");
+  const confirmed = await confirmationPromise;
+  assert.equal(requestCount, 2);
+  assert.deepEqual(confirmed, {
+    state: "PREPARE",
+    filename: "holder-v2__mcp_42",
+  });
+});
+
+test("BambuNetwork does not carry an old job state into a new job name", async () => {
+  const bridge = new BambuNetworkBridge();
+  let requestCount = 0;
+  bridge.request = async () => {
+    requestCount += 1;
+    const print =
+      requestCount === 1
+        ? {
+            command: "push_status",
+            gcode_state: "RUNNING",
+            subtask_name: "older-job",
+          }
+        : requestCount === 2
+          ? {
+              command: "push_status",
+              subtask_name: "holder-v2__mcp_42",
+            }
+          : {
+              command: "push_status",
+              gcode_state: "PREPARE",
+            };
+    return {
+      ok: true,
+      events: [
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({ print }),
+          },
+        },
+      ],
+    };
+  };
+
+  const confirmed = await bridge.waitForPrinterJobStart(
+    "TEST-DEVICE",
+    ["holder-v2__mcp_42"],
+    { confirmationTimeoutMs: 1_000 }
+  );
+  assert.equal(requestCount, 3);
+  assert.deepEqual(confirmed, {
+    state: "PREPARE",
+    filename: "holder-v2__mcp_42",
+  });
+});
+
+test("BambuNetwork does not count a paused job as start confirmation", async () => {
+  const bridge = new BambuNetworkBridge();
+  let requestCount = 0;
+  bridge.request = async () => {
+    requestCount += 1;
+    return {
+      ok: true,
+      events: [
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: {
+                command: "push_status",
+                gcode_state: requestCount === 1 ? "PAUSED" : "RUNNING",
+                subtask_name: "holder-v2__mcp_42",
+              },
+            }),
+          },
+        },
+      ],
+    };
+  };
+
+  const confirmed = await bridge.waitForPrinterJobStart(
+    "TEST-DEVICE",
+    ["holder-v2__mcp_42"],
+    { confirmationTimeoutMs: 1_000 }
+  );
+  assert.equal(requestCount, 2);
+  assert.deepEqual(confirmed, {
+    state: "RUNNING",
+    filename: "holder-v2__mcp_42",
+  });
+});
+
+test("BambuNetwork job confirmation requires the current submission marker", async () => {
+  const bridge = new BambuNetworkBridge();
+  let requestCount = 0;
+  bridge.request = async () => {
+    requestCount += 1;
+    return {
+      ok: true,
+      events: [
+        {
+          name: "on_local_message",
+          payload: {
+            dev_id: "TEST-DEVICE",
+            msg: JSON.stringify({
+              print: {
+                command: "push_status",
+                gcode_state: "RUNNING",
+                subtask_name:
+                  requestCount === 1
+                    ? "widget"
+                    : "widget_plate_1__mcp_a1b2c3d4e5f6",
+              },
+            }),
+          },
+        },
+      ],
+    };
+  };
+
+  const confirmed = await bridge.waitForPrinterJobStart(
+    "TEST-DEVICE",
+    ["widget_plate_1__mcp_a1b2c3d4e5f6"],
+    { confirmationTimeoutMs: 1_000 }
+  );
+  assert.equal(requestCount, 2);
+  assert.equal(confirmed.filename, "widget_plate_1__mcp_a1b2c3d4e5f6");
 });
 
 test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", async () => {
