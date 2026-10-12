@@ -12,7 +12,7 @@ def inDocker(String image, String script) {
 
 def ciSteps = '''npm ci
 npm test
-npm audit --omit=dev
+node scripts/audit-allowlist.mjs
 npm run privacy:check
 npm run privacy:history
 npm pack --dry-run'''
