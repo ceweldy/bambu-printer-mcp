@@ -5,7 +5,7 @@ def inDocker(String image, String script) {
     sh """
         set -eu
         tar -cf - . | docker run --rm -i --memory 6g --cpus 4 \\
-          -e CI=true -e HOME=/tmp/home ${image} \\
+          -e CI=true -e HOME=/tmp/home -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0="*" ${image} \\
           sh -c 'mkdir -p /src /tmp/home && cd /src && tar -xf - && git config --global --add safe.directory /src 2>/dev/null || true; sh .ci-step.sh'
     """
 }
