@@ -10,7 +10,7 @@ def inDocker(String image, String script) {
     """
 }
 
-def steps = '''npm ci
+def ciSteps = '''npm ci
 npm test
 npm audit --omit=dev
 npm run privacy:check
@@ -24,8 +24,8 @@ pipeline {
         stage('Checkout history') { steps { sh 'git fetch --unshallow --quiet || true' } }
         stage('Validate') {
             parallel {
-                stage('Node 20') { steps { script { inDocker('node:20', steps) } } }
-                stage('Node 22') { steps { script { inDocker('node:22', steps) } } }
+                stage('Node 20') { steps { script { inDocker('node:20', ciSteps) } } }
+                stage('Node 22') { steps { script { inDocker('node:22', ciSteps) } } }
             }
         }
     }
