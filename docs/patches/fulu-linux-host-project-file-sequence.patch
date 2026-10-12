@@ -1,0 +1,64 @@
+diff --git a/tools/pjarczak_bambu_linux_host/LinuxPluginHost.cpp b/tools/pjarczak_bambu_linux_host/LinuxPluginHost.cpp
+index fe38123c..1516360e 100644
+--- a/tools/pjarczak_bambu_linux_host/LinuxPluginHost.cpp
++++ b/tools/pjarczak_bambu_linux_host/LinuxPluginHost.cpp
+@@ -743,6 +743,8 @@ nlohmann::json LinuxPluginHost::handle(const std::string& method, const nlohmann
+         out["source_so_present"] = path_exists(plugin_folder / linux_source_library_name());
+         out["manifest_present"] = path_exists(plugin_folder / linux_payload_manifest_file_name());
+         out["network_loaded"] = m_network != nullptr;
++        out["project_file_sequence_id"] =
++            has_network_symbol("bambu_network_get_last_project_file_sequence_id");
+         out["source_loaded"] = m_source != nullptr;
+         out["network_status"] = m_network_status;
+         out["source_status"] = m_source_status;
+@@ -751,7 +753,13 @@ nlohmann::json LinuxPluginHost::handle(const std::string& method, const nlohmann
+         return out;
+     }
+     if (method == "bridge.capabilities") {
+-        return {{"ok", true}, {"agent_count", m_agents.size()}, {"auth_capabilities", auth_capabilities()}};
++        return {
++            {"ok", true},
++            {"agent_count", m_agents.size()},
++            {"project_file_sequence_id",
++             has_network_symbol("bambu_network_get_last_project_file_sequence_id")},
++            {"auth_capabilities", auth_capabilities()},
++        };
+     }
+     if (method == "bridge.runtime_info") {
+         char cwd_buf[4096] = {0};
+@@ -1111,8 +1111,16 @@ nlohmann::json LinuxPluginHost::handle(const std::string& method, const nlohmann
+             [job]() {
+                 return job->cancel_requested.load();
+             });
++        auto get_sequence_id =
++            net<std::string (*)(void*)>("bambu_network_get_last_project_file_sequence_id");
++        const std::string sequence_id = get_sequence_id ? get_sequence_id(a) : std::string();
+         unregister_job(job_id);
+-        return {{"ok", true}, {"value", ret}, {"job_id", job_id}};
++        return {
++            {"ok", true},
++            {"value", ret},
++            {"job_id", job_id},
++            {"project_file_sequence_id", sequence_id},
++        };
+     }
+     if (method == "net.start_send_gcode_to_sdcard") {
+         auto f = net<int (*)(void*, BBL::PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)>("bambu_network_start_send_gcode_to_sdcard");
+@@ -1154,8 +1162,16 @@ nlohmann::json LinuxPluginHost::handle(const std::string& method, const nlohmann
+             [job]() {
+                 return job->cancel_requested.load();
+             });
++        auto get_sequence_id =
++            net<std::string (*)(void*)>("bambu_network_get_last_project_file_sequence_id");
++        const std::string sequence_id = get_sequence_id ? get_sequence_id(a) : std::string();
+         unregister_job(job_id);
+-        return {{"ok", true}, {"value", ret}, {"job_id", job_id}};
++        return {
++            {"ok", true},
++            {"value", ret},
++            {"job_id", job_id},
++            {"project_file_sequence_id", sequence_id},
++        };
+     }
+     if (method == "net.get_studio_info_url") { auto f = net<std::string (*)(void*)>("bambu_network_get_studio_info_url"); auto a = lookup_agent(); return f && a ? nlohmann::json{{"ok", true}, {"value", f(a)}} : not_supported(method); }
+     if (method == "net.modify_printer_name") { auto f = net<int (*)(void*, std::string, std::string)>("bambu_network_modify_printer_name"); auto a = lookup_agent(); return f && a ? nlohmann::json{{"ok", true}, {"value", f(a, payload.value("dev_id", std::string()), payload.value("dev_name", std::string()))}} : not_supported(method); }

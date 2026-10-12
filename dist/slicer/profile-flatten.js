@@ -27,6 +27,26 @@ import crypto from "node:crypto";
 /* -------------------------------------------------------------------------- */
 /* Indexing                                                                    */
 /* -------------------------------------------------------------------------- */
+async function listJsonFilesRecursively(dir) {
+    let entries;
+    try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+    }
+    catch {
+        return [];
+    }
+    const files = [];
+    for (const entry of entries) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            files.push(...(await listJsonFilesRecursively(entryPath)));
+        }
+        else if (entry.isFile() && entry.name.endsWith(".json")) {
+            files.push(entryPath);
+        }
+    }
+    return files;
+}
 /**
  * Build a name -> {filePath, data} map for every JSON in
  * <profilesRoot>/<vendor>/{machine,process,filament}/.
@@ -41,19 +61,7 @@ async function buildNameIndex(profilesRoot, vendor) {
     const subdirs = ["machine", "process", "filament"];
     for (const sub of subdirs) {
         const dir = path.join(profilesRoot, vendor, sub);
-        let entries;
-        try {
-            entries = await fs.readdir(dir);
-        }
-        catch {
-            // Vendor or subdir missing -- skip silently; flatten will fail later
-            // with a precise "name not found" error.
-            continue;
-        }
-        for (const entry of entries) {
-            if (!entry.endsWith(".json"))
-                continue;
-            const filePath = path.join(dir, entry);
+        for (const filePath of await listJsonFilesRecursively(dir)) {
             let raw;
             try {
                 raw = await fs.readFile(filePath, "utf8");
@@ -330,9 +338,10 @@ function normalizeForCli(flat, kind, leafName) {
     // the correct list ([machine_leaf_name]) so just preserve.
     // _condition fields can stay null (string-typed, tolerated as null).
 }
-function applyBedType(processFlat, bedType) {
+function applyBedType(machineFlat, processFlat, bedType) {
     if (!bedType)
         return;
+    machineFlat.default_bed_type = bedType;
     processFlat.curr_bed_type = bedType;
 }
 function applyMachineModelBedMetadata(machineFlat, index) {
@@ -384,7 +393,7 @@ export async function flattenForCli(opts) {
     normalizeForCli(machineFlat, "machine", opts.machineLeaf);
     normalizeForCli(processFlat, "process", opts.processLeaf);
     filamentFlats.forEach((f, i) => normalizeForCli(f, "filament", opts.filamentLeaves[i]));
-    applyBedType(processFlat, opts.bedType);
+    applyBedType(machineFlat, processFlat, opts.bedType);
     // Mirror the GUI's auto-extend behavior: when the caller explicitly
     // chose a process or filament that wasn't pre-declared compatible with
     // the chosen machine (e.g. "0.20mm Standard @BBL P1P" used on a P1S),

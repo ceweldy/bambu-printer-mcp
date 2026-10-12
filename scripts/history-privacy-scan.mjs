@@ -17,10 +17,18 @@ const allowedCommitEmail = (email) =>
   email.toLowerCase() === "noreply@github.com";
 
 const findings = [];
+const configuredRevision = process.env.PRIVACY_SCAN_REF?.trim();
+const revisionArgs = configuredRevision ? [configuredRevision] : ["--all"];
+const skipSyntheticTipMetadata =
+  process.env.PRIVACY_SCAN_SKIP_SYNTHETIC_TIP_METADATA === "1";
+const metadataRevisionArgs =
+  configuredRevision && skipSyntheticTipMetadata
+    ? [`${configuredRevision}^@`]
+    : revisionArgs;
 const commitLines = git(
   "log",
-  "--all",
   "--format=%H%x09%ae%x09%ce",
+  ...metadataRevisionArgs,
 )
   .trim()
   .split(/\r?\n/u)
@@ -100,7 +108,7 @@ const contentRules = [
 ];
 
 const objectPaths = new Map();
-const commits = git("rev-list", "--all")
+const commits = git("rev-list", ...revisionArgs)
   .trim()
   .split(/\r?\n/u)
   .filter(Boolean);

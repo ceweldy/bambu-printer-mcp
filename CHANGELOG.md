@@ -17,6 +17,11 @@
 ### Changed
 
 - MCP resources use configured printer IDs instead of LAN addresses.
+- BambuStudio CLI profile flattening is enabled by default, with an explicit
+  `BAMBU_CLI_FLATTEN=0` escape hatch for diagnostics.
+- P1/A1/X1 local `project_file` commands use firmware-safe `bed_type: auto`
+  metadata, right-align the fixed five-entry AMS mapping, and wait for an
+  explicit printer acknowledgement before reporting success.
 - Package metadata now points to the public `ceweldy/bambu-printer-mcp` continuation.
 - `basic-ftp` and vulnerable transitive dependencies are updated or overridden to patched versions.
 - The supported runtime is Node.js 20 or newer to match the secured HTTP adapter.
@@ -25,6 +30,56 @@
 
 ### Fixed
 
+- Nested vendor filament profiles, including SUNLU profiles, now resolve their
+  full inheritance chain instead of silently falling back to PLA metadata.
+- SuperTack raw-STL slices use a validated High Temp Plate CLI fallback, then
+  rewrite the finished 3MF with the used filaments' initial and steady
+  SuperTack temperatures, consistent project and per-plate metadata, G-code
+  hash, and archive checks.
+- BambuStudio output is checked for requested filament, preset, printable
+  G-code, and plate consistency before a sliced 3MF is returned.
+- Negative or missing `project_file` acknowledgements are surfaced as failures
+  instead of returning a false "sent successfully" result. Result-less local
+  command echoes are ignored until the printer replies or enters an active state.
+- Idle printers can reset and resume an incomplete AMS load or unload operation
+  through the dedicated `reset_ams` recovery tool.
+- Idle printers can explicitly load a validated absolute AMS slot at a bounded
+  nozzle temperature through `load_ams_filament`.
+- Idle printers can complete an acknowledged AMS unload through
+  `unload_ams_filament`.
+- Idle printers can be restarted through `reboot_printer`; active print states
+  and unknown printer states are rejected before the system reboot command is
+  sent.
+- FTPS uploads allow a bounded 60-second data-channel window and a longer TLS
+  session-ticket wait for printers whose file service recovers slowly after reboot.
+- Post-January 2025 firmware `print.*` commands are wrapped in canonical
+  RSA-SHA256 signed envelopes using the configured Bambu client certificate,
+  while G-code-line encryption is gated to printer families known to require it.
+- BambuNetwork LAN printing now stages the complete public certificate bundle,
+  atomically selects both files from one source directory, initializes it before
+  agent startup, connects the selected printer, waits for the local connection
+  callback, dispatches the void device-certificate refresh request, and only
+  then submits the print. Incomplete explicitly configured bundles fail closed.
+- BambuNetwork local prints wait for the printer's `project_file`
+  response with the exact submitted sequence ID, then confirm through a
+  separate live `push_status` report that the exact job entered PREPARE or
+  RUNNING. Each submission gets a server-generated status marker. Delayed
+  responses and stale status snapshots from earlier attempts are ignored.
+  Differential P1/P1S status fields accumulate from the exact job name into a
+  later active state. A job-name change clears inherited state, and paused
+  states do not satisfy the PREPARE or RUNNING start gate.
+  Polling, wait replies, and cancellation remain available while the serialized
+  host worker runs a print, and print waiters route unrelated events back to
+  the control polling lane.
+- BambuNetwork local printing now verifies sequence-correlation capability
+  before upload, uses a stable remote archive filename across retries, and
+  bounds the status-only submission marker to valid UTF-8 within 96 bytes.
+  The unconfirmable `start_local_print_with_record` path is no longer exposed
+  through the public print tools.
+  Signed-command error `84033543` is reported as a Developer Mode or
+  authenticated stock-plugin requirement instead of a false success.
+- P1S BambuNetwork jobs default to the required `sdcard/` FTP folder, and the
+  bridge status tool can run a non-print LAN printer readiness probe.
 - Printer access tokens are fingerprinted rather than embedded in internal connection-map keys.
 - Unknown printer model metadata and unusual status transitions no longer terminate the process.
 - Initial fleet and reconnect responses wait for the first operational status

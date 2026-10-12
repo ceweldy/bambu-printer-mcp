@@ -28,6 +28,7 @@
     "src",
     "patches",
     "docs",
+    "docs/patches",
     "README.md",
     "CHANGELOG.md",
     "SECURITY.md",

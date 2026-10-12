@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, sign as cryptoSign, X509Certificate, } from "node:crypto";
 import fs from "node:fs/promises";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, } from "node:fs";
 import os from "node:os";
@@ -71,6 +71,55 @@ export function loadClientCreds() {
 }
 const CLIENT_CREDS = loadClientCreds();
 const COMMAND_SETTLE_MS = 300;
+function canonicalizeJsonValue(value) {
+    if (Array.isArray(value)) {
+        return value.map(canonicalizeJsonValue);
+    }
+    if (value && typeof value === "object") {
+        return Object.keys(value)
+            .sort()
+            .reduce((result, key) => {
+            result[key] = canonicalizeJsonValue(value[key]);
+            return result;
+        }, {});
+    }
+    return value;
+}
+export function canonicalJson(value) {
+    return JSON.stringify(canonicalizeJsonValue(value));
+}
+export function createSignedPrintEnvelope(payload, privateKey, certId) {
+    if (!payload?.print || typeof payload.print !== "object") {
+        throw new Error("Signed Bambu command envelopes require a print payload.");
+    }
+    const bytesToSign = Buffer.from(`{"print":${canonicalJson(payload.print)}}`, "utf8");
+    return {
+        ...payload,
+        header: {
+            sign_ver: "v1.0",
+            sign_alg: "RSA_SHA256",
+            sign_string: cryptoSign("RSA-SHA256", bytesToSign, privateKey).toString("base64"),
+            cert_id: certId,
+            payload_len: bytesToSign.length,
+        },
+    };
+}
+export function requiresEncryptedGcodeLine(printerSerial) {
+    const override = process.env.BAMBU_REQUIRE_ENCRYPTED_GCODE_LINE;
+    if (override === "1")
+        return true;
+    if (override === "0")
+        return false;
+    return printerSerial.startsWith("093") || printerSerial.startsWith("094");
+}
+function getClientCertId(cert, printerSerial) {
+    const certificate = new X509Certificate(cert);
+    const serialHex = certificate.serialNumber
+        .toLowerCase()
+        .replace(/[^0-9a-f]/g, "")
+        .padStart(32, "0");
+    return `${serialHex}CN=${printerSerial}.bambulab.com`;
+}
 const MODEL_ID_TO_NAME = {
     O1C: "H2C",
     O1C2: "H2C",
@@ -215,6 +264,23 @@ class TolerantBambuClient extends BambuClient {
             }
         }
         return [undefined];
+    }
+    publish(payload) {
+        if (CLIENT_CREDS &&
+            payload &&
+            typeof payload === "object" &&
+            payload.print &&
+            !payload.header) {
+            if (payload.print.command === "gcode_line") {
+                if (requiresEncryptedGcodeLine(this.config.serialNumber)) {
+                    return Promise.reject(new Error("This printer requires printer-key param_enc encryption for gcode_line commands, which is not yet available."));
+                }
+                return super.publish(payload);
+            }
+            const certId = getClientCertId(CLIENT_CREDS.cert, this.config.serialNumber);
+            return super.publish(createSignedPrintEnvelope(payload, CLIENT_CREDS.key, certId));
+        }
+        return super.publish(payload);
     }
 }
 /** Build FTPS secureOptions that include the client cert+key when available. */
@@ -446,6 +512,210 @@ export class BambuImplementation {
     async getPrinter(host, serial, token) {
         return this.printerStore.getPrinter(host, serial, token);
     }
+    async getIdlePrinter(host, serial, token, action) {
+        const printer = await this.getPrinter(host, serial, token);
+        let data = printer.data ?? {};
+        if (!hasOperationalStatus(data)) {
+            const report = await this.printerStore.waitForInitialReport(host, serial, token);
+            const latestData = printer.data ?? {};
+            data = hasOperationalStatus(latestData) ? latestData : (report ?? latestData);
+        }
+        const currentState = String(data.gcode_state ?? "").trim().toUpperCase();
+        const idleStates = new Set(["IDLE", "FINISH", "FAILED"]);
+        if (!idleStates.has(currentState)) {
+            throw new Error(`${action} is allowed only while the printer is idle; current print state is ${currentState || "UNKNOWN"}.`);
+        }
+        return printer;
+    }
+    async publishPrintCommandAndWait(printer, payload, timeoutMs = 5000) {
+        const eventPrinter = printer;
+        if (typeof eventPrinter.on !== "function" ||
+            typeof eventPrinter.off !== "function") {
+            await printer.publish(payload);
+            await sleep(COMMAND_SETTLE_MS);
+            return null;
+        }
+        const command = String(payload?.print?.command ?? "");
+        const sequenceId = String(payload?.print?.sequence_id ?? "");
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (error, response) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timeout);
+                eventPrinter.off("rawMessage", onRawMessage);
+                if (error)
+                    reject(error);
+                else
+                    resolve(response ?? {});
+            };
+            const onRawMessage = (_topic, body) => {
+                let data;
+                try {
+                    const parsed = JSON.parse(Buffer.isBuffer(body) ? body.toString("utf8") : String(body));
+                    data = parsed?.print;
+                }
+                catch {
+                    return;
+                }
+                if (!data ||
+                    String(data.command ?? "") !== command ||
+                    (sequenceId &&
+                        data.sequence_id !== undefined &&
+                        String(data.sequence_id) !== sequenceId)) {
+                    return;
+                }
+                const outcome = String(data.result ?? "").trim().toUpperCase();
+                const errorCode = [
+                    data.return_code,
+                    data.err_code,
+                    data.error_code,
+                    data.fail_reason,
+                ].find((value) => value !== undefined &&
+                    value !== null &&
+                    String(value).trim().length > 0 &&
+                    String(value).trim() !== "0");
+                if ((outcome && outcome !== "SUCCESS") ||
+                    (!outcome && errorCode !== undefined)) {
+                    const details = [data.reason, errorCode]
+                        .filter((value) => value !== undefined &&
+                        value !== null &&
+                        String(value).trim().length > 0)
+                        .map(String);
+                    finish(new Error(`Printer rejected ${command}${details.length > 0 ? `: ${details.join(" / ")}` : "."}`));
+                    return;
+                }
+                if (outcome === "SUCCESS") {
+                    finish(undefined, data);
+                }
+            };
+            const timeout = setTimeout(() => {
+                finish(new Error(`Printer did not acknowledge ${command}.`));
+            }, timeoutMs);
+            eventPrinter.on("rawMessage", onRawMessage);
+            printer.publish(payload).catch((error) => {
+                finish(error instanceof Error ? error : new Error(String(error)));
+            });
+        });
+    }
+    async publishProjectFileAndWait(printer, payload, expectedRemoteFile, timeoutMs = 8000) {
+        const eventPrinter = printer;
+        if (typeof eventPrinter.on !== "function" ||
+            typeof eventPrinter.off !== "function") {
+            await printer.publish(payload);
+            await sleep(COMMAND_SETTLE_MS);
+            return null;
+        }
+        const sequenceId = String(payload?.print?.sequence_id ?? "");
+        const previousFile = String(eventPrinter.data?.subtask_name ?? eventPrinter.data?.gcode_file ?? "");
+        const previousState = String(eventPrinter.data?.gcode_state ?? "").toUpperCase();
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (error, response) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timeout);
+                eventPrinter.off("message", onMessage);
+                if (error) {
+                    reject(error);
+                }
+                else {
+                    resolve(response ?? {});
+                }
+            };
+            const describeFailure = (response) => {
+                const details = [
+                    response.reason,
+                    response.return_code,
+                    response.err_code,
+                    response.error_code,
+                ]
+                    .filter((value) => value !== undefined && value !== null && String(value).length > 0)
+                    .map(String);
+                const verificationFailed = details.some((value) => {
+                    const normalized = value.trim().toLowerCase().replace(/^0x/, "");
+                    return normalized === "84033543" || normalized === "05024007" || normalized === "5024007";
+                });
+                const suffix = verificationFailed
+                    ? " MQTT message verification failed. Configure the per-printer Bambu client certificate and private key, or use the BambuNetwork bridge."
+                    : "";
+                return new Error(`Printer rejected the project file${details.length > 0 ? `: ${details.join(" / ")}.` : "."}${suffix}`);
+            };
+            const onMessage = (_topic, category, data) => {
+                if (category !== "print" ||
+                    data?.command !== "project_file" ||
+                    (sequenceId && data?.sequence_id !== undefined && String(data.sequence_id) !== sequenceId)) {
+                    return;
+                }
+                const outcome = String(data.result ?? "").trim().toUpperCase();
+                if (!outcome) {
+                    const errorCode = [
+                        data.return_code,
+                        data.err_code,
+                        data.error_code,
+                        data.fail_reason,
+                    ].find((value) => value !== undefined &&
+                        value !== null &&
+                        String(value).trim().length > 0 &&
+                        String(value).trim() !== "0");
+                    if (errorCode !== undefined) {
+                        finish(describeFailure(data));
+                    }
+                    return;
+                }
+                if (outcome !== "SUCCESS") {
+                    finish(describeFailure(data));
+                    return;
+                }
+                finish(undefined, data);
+            };
+            const timeout = setTimeout(() => {
+                const data = eventPrinter.data ?? {};
+                const currentFile = String(data.subtask_name ?? data.gcode_file ?? "");
+                const currentState = String(data.gcode_state ?? "").toUpperCase();
+                const currentFileLower = currentFile.toLowerCase();
+                const expectedFileLower = expectedRemoteFile.toLowerCase();
+                const fileMatches = currentFileLower.length > 0 &&
+                    (currentFileLower.includes(expectedFileLower) ||
+                        expectedFileLower.includes(currentFileLower));
+                const attributableTransition = currentState !== previousState || currentFile !== previousFile;
+                const acceptedByState = ["PREPARE", "SLICING", "RUNNING", "PAUSE"].includes(currentState) &&
+                    fileMatches &&
+                    attributableTransition;
+                if (acceptedByState) {
+                    finish(undefined, {
+                        command: "project_file",
+                        result: "SUCCESS",
+                        reason: "printer entered an active print state",
+                        sequence_id: sequenceId,
+                    });
+                    return;
+                }
+                const errorCode = [
+                    data.print_error,
+                    data.err_code,
+                    data.mc_print_error_code,
+                    data.fail_reason,
+                ].find((value) => value !== undefined &&
+                    value !== null &&
+                    String(value).trim().length > 0 &&
+                    String(value).trim() !== "0");
+                if (currentState === "FAILED") {
+                    finish(new Error(errorCode === undefined
+                        ? "Printer rejected the project file."
+                        : `Printer rejected the project file: error code ${String(errorCode)}.`));
+                    return;
+                }
+                finish(new Error("Printer did not acknowledge the project_file command or enter an active print state."));
+            }, timeoutMs);
+            eventPrinter.on("message", onMessage);
+            printer.publish(payload).catch((error) => {
+                finish(error instanceof Error ? error : new Error(String(error)));
+            });
+        });
+    }
     async resolveProjectFileMetadata(localThreeMfPath, plateIndex) {
         const archive = await fs.readFile(localThreeMfPath);
         const zip = await JSZip.loadAsync(archive);
@@ -675,7 +945,17 @@ export class BambuImplementation {
             });
         }
         else {
-            amsMapping = Array.from({ length: 5 }, (_, i) => i < baseMapping.length ? baseMapping[i] : -1);
+            if (baseMapping.length > 5) {
+                throw new Error(`P1/A1/X1 project_file supports at most 5 project filament positions; got ${baseMapping.length}.`);
+            }
+            // P1/A1/X1 firmware uses a fixed five-entry mapping with project
+            // filament positions right-aligned. A one-filament project therefore
+            // maps to [-1, -1, -1, -1, tray], not [tray, -1, -1, -1, -1].
+            amsMapping = Array(5).fill(-1);
+            const offset = amsMapping.length - baseMapping.length;
+            baseMapping.forEach((value, index) => {
+                amsMapping[offset + index] = value;
+            });
             amsMapping2 = [];
         }
         const b = (v) => (v ? 1 : 0);
@@ -713,39 +993,47 @@ export class BambuImplementation {
             };
         }
         else {
+            const sequenceId = String(Date.now() & 0x7fffffff);
             projectFileCmd = {
                 print: {
+                    sequence_id: sequenceId,
                     command: "project_file",
                     param: `Metadata/${projectMetadata.plateFileName}`,
                     url: projectUrl,
-                    subtask_name: options.projectName,
+                    file: remoteFileName,
+                    subtask_name: remoteFileName,
+                    plate_idx: options.plateIndex ?? 0,
                     md5,
                     flow_cali: options.flowCalibration ?? true,
                     layer_inspect: options.layerInspect ?? true,
                     vibration_cali: options.vibrationCalibration ?? true,
                     bed_leveling: options.bedLeveling ?? true,
-                    bed_type: options.bedType || "textured_plate",
+                    bed_levelling: options.bedLeveling ?? true,
+                    // Local project files carry their plate type in the sliced package.
+                    // "auto" is the firmware contract for local prints and avoids
+                    // rejecting newer plate tokens that older P1/A1/X1 firmware does
+                    // not recognize in the MQTT envelope.
+                    bed_type: "auto",
                     timelapse: options.timelapse ?? false,
                     use_ams: options.useAMS !== false,
                     ams_mapping: amsMapping,
                     profile_id: "0",
                     project_id: "0",
-                    sequence_id: "0",
                     subtask_id: "0",
                     task_id: "0",
                 },
             };
         }
-        await printer.publish(projectFileCmd);
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        const acceptance = await this.publishProjectFileAndWait(printer, projectFileCmd, remoteFileName);
         return {
             status: "success",
-            message: `Uploaded and started 3MF print: ${options.projectName}`,
+            message: `Printer accepted 3MF print: ${options.projectName}`,
             remoteProjectPath,
             plateFile: projectMetadata.plateFileName,
             platePath: projectMetadata.plateInternalPath,
             md5,
             amsMapping,
+            acceptance,
         };
     }
     async cancelJob(host, serial, token) {
@@ -788,6 +1076,89 @@ export class BambuImplementation {
         });
         await sleep(COMMAND_SETTLE_MS);
         return { status: "success", message: "HMS clear command sent." };
+    }
+    async resetAms(host, serial, token) {
+        const printer = await this.getIdlePrinter(host, serial, token, "AMS reset");
+        const sequenceBase = Date.now() & 0x7fffffff;
+        const resetAcceptance = await this.publishPrintCommandAndWait(printer, {
+            print: {
+                command: "ams_control",
+                param: "reset",
+                sequence_id: String(sequenceBase),
+            },
+        });
+        const resumeAcceptance = await this.publishPrintCommandAndWait(printer, {
+            print: {
+                command: "ams_control",
+                param: "resume",
+                sequence_id: String(sequenceBase + 1),
+            },
+        });
+        return {
+            status: "success",
+            message: "AMS reset and resume commands sent. Filament motion may continue until the AMS returns to idle.",
+            acceptance: {
+                reset: resetAcceptance,
+                resume: resumeAcceptance,
+            },
+        };
+    }
+    async loadAmsFilament(host, serial, token, slot, targetTemperature) {
+        if (!Number.isInteger(slot) || slot < 0 || slot > 15) {
+            throw new Error("slot must be an absolute AMS tray index from 0 to 15.");
+        }
+        const normalizedSlot = slot;
+        const normalizedTemperature = Math.trunc(targetTemperature);
+        if (!Number.isFinite(normalizedTemperature) ||
+            normalizedTemperature < 170 ||
+            normalizedTemperature > 300) {
+            throw new Error("target_temperature must be from 170 to 300 degrees Celsius.");
+        }
+        const printer = await this.getIdlePrinter(host, serial, token, "AMS filament loading");
+        const currentTemperature = Math.max(0, Math.trunc(Number(printer.data?.nozzle_temper ?? 0)));
+        const acceptance = await this.publishPrintCommandAndWait(printer, {
+            print: {
+                command: "ams_change_filament",
+                target: normalizedSlot,
+                curr_temp: currentTemperature,
+                tar_temp: normalizedTemperature,
+                sequence_id: String(Date.now() & 0x7fffffff),
+            },
+        });
+        return {
+            status: "success",
+            message: `AMS load command sent for absolute slot ${normalizedSlot}.`,
+            slot: normalizedSlot,
+            target_temperature: normalizedTemperature,
+            acceptance,
+        };
+    }
+    async unloadAmsFilament(host, serial, token) {
+        const printer = await this.getIdlePrinter(host, serial, token, "AMS filament unloading");
+        const acceptance = await this.publishPrintCommandAndWait(printer, {
+            print: {
+                command: "unload_filament",
+                sequence_id: String(Date.now() & 0x7fffffff),
+            },
+        });
+        return {
+            status: "success",
+            message: "AMS unload command accepted.",
+            acceptance,
+        };
+    }
+    async rebootPrinter(host, serial, token) {
+        const printer = await this.getIdlePrinter(host, serial, token, "Printer reboot");
+        await printer.publish({
+            system: {
+                command: "reboot",
+            },
+        });
+        await sleep(COMMAND_SETTLE_MS);
+        return {
+            status: "success",
+            message: "Printer reboot command sent. The printer will disconnect while restarting.",
+        };
     }
     async setPrintSpeed(host, serial, token, speedMode) {
         const printer = await this.getPrinter(host, serial, token);
@@ -1375,7 +1746,7 @@ export class BambuImplementation {
      * again, resulting in e.g. /cache/cache/file.3mf).
      */
     async ftpUpload(host, token, localPath, remotePath) {
-        const client = new FTPClient(15000);
+        const client = new FTPClient(60000);
         try {
             await client.access({
                 host,
@@ -1406,7 +1777,7 @@ export class BambuImplementation {
         if (socket.getSession())
             return;
         await new Promise((resolve) => {
-            const timeout = setTimeout(resolve, 1000);
+            const timeout = setTimeout(resolve, 5000);
             socket.once("session", () => {
                 clearTimeout(timeout);
                 resolve();

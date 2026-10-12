@@ -84,6 +84,7 @@ test("STLManipulator flattening uses the active slicer_path profile root", async
     BAMBU_CLI_FLATTEN: process.env.BAMBU_CLI_FLATTEN,
     BAMBU_SLICER_PROFILE_DIRS: process.env.BAMBU_SLICER_PROFILE_DIRS,
     BAMBU_PROFILES_ROOT: process.env.BAMBU_PROFILES_ROOT,
+    BAMBU_CLI_VALIDATE_OUTPUT: process.env.BAMBU_CLI_VALIDATE_OUTPUT,
     SLICER_PATH: process.env.SLICER_PATH,
   };
   t.after(async () => {
@@ -150,6 +151,7 @@ test("STLManipulator flattening uses the active slicer_path profile root", async
   await fs.chmod(activeSlicerPath, 0o755);
 
   process.env.BAMBU_CLI_FLATTEN = "true";
+  process.env.BAMBU_CLI_VALIDATE_OUTPUT = "0";
   process.env.BAMBU_SLICER_PROFILE_DIRS = activeBbl;
   delete process.env.BAMBU_PROFILES_ROOT;
   process.env.SLICER_PATH = wrongSlicerPath;
@@ -243,6 +245,52 @@ test("inherits chain: child wins on key collision, root parent fills the rest", 
 
   // nozzle_volume_type derived as array from default_nozzle_volume_type
   assert.deepEqual(flat.nozzle_volume_type, ["Standard"]);
+});
+
+test("nested vendor filament profiles are indexed and fully flattened", async () => {
+  const { root, bbl } = await makeSyntheticTree();
+  await writeProfile(bbl, "machine", {
+    name: "Bambu Lab TEST 0.4 nozzle",
+    inherits: null,
+    nozzle_diameter: ["0.4"],
+    default_nozzle_volume_type: ["Standard"],
+  });
+  await writeProfile(bbl, "process", {
+    name: "0.20mm @TEST",
+    inherits: null,
+    layer_height: 0.2,
+  });
+  await writeProfile(bbl, "filament", {
+    name: "Vendor PETG @base",
+    inherits: null,
+    filament_type: ["PETG"],
+    filament_vendor: ["Vendor"],
+    nozzle_temperature: ["245"],
+  });
+  const vendorDir = path.join(bbl, "filament", "Vendor");
+  await fs.mkdir(vendorDir, { recursive: true });
+  await fs.writeFile(
+    path.join(vendorDir, "Vendor PETG @TEST.json"),
+    JSON.stringify({
+      name: "Vendor PETG @TEST",
+      inherits: "Vendor PETG @base",
+      compatible_printers: ["Bambu Lab TEST 0.4 nozzle"],
+    }),
+    "utf8"
+  );
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "flat-nested-vendor-"));
+  const result = await flattenForCli({
+    machineLeaf: "Bambu Lab TEST 0.4 nozzle",
+    processLeaf: "0.20mm @TEST",
+    filamentLeaves: ["Vendor PETG @TEST"],
+    profilesRoot: root,
+    tempDir,
+  });
+  const filament = JSON.parse(await fs.readFile(result.filamentPaths[0], "utf8"));
+  assert.deepEqual(filament.filament_type, ["PETG"]);
+  assert.deepEqual(filament.filament_vendor, ["Vendor"]);
+  assert.deepEqual(filament.nozzle_temperature, ["245"]);
 });
 
 test("inherits cycle is detected and reported", async () => {
@@ -352,7 +400,9 @@ test("bedType override stamps the flattened process profile", async () => {
   });
 
   const process = JSON.parse(await fs.readFile(result.processPath, "utf8"));
+  const machine = JSON.parse(await fs.readFile(result.machinePath, "utf8"));
   assert.equal(process.curr_bed_type, "Textured PEI Plate");
+  assert.equal(machine.default_bed_type, "Textured PEI Plate");
 });
 
 test("machine-model bed metadata is copied onto flattened machine profile", async () => {
@@ -464,6 +514,38 @@ test("end-to-end against real BBL tree: H2S 0.4 nozzle flattens to a populated p
     keyCount > 100,
     `flattened machine profile should have >100 keys after inherits walk; got ${keyCount}`
   );
+});
+
+test("end-to-end against real BBL tree: nested SUNLU PETG keeps PETG metadata", async (t) => {
+  const profilesRoot = detectProfilesRoot();
+  const leafPath = path.join(
+    profilesRoot,
+    "BBL",
+    "filament",
+    "SUNLU",
+    "SUNLU PETG @BBL X1C.json"
+  );
+  try {
+    await fs.access(leafPath);
+  } catch {
+    t.skip("Installed BambuStudio profiles do not include nested SUNLU PETG");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "flat-sunlu-petg-"));
+  const result = await flattenForCli({
+    machineLeaf: "Bambu Lab P1S 0.4 nozzle",
+    processLeaf: "0.20mm Standard @BBL X1C",
+    filamentLeaves: ["SUNLU PETG @BBL X1C"],
+    profilesRoot,
+    tempDir,
+    bedType: "High Temp Plate",
+  });
+  const filament = JSON.parse(await fs.readFile(result.filamentPaths[0], "utf8"));
+  assert.deepEqual(filament.filament_type, ["PETG"]);
+  assert.deepEqual(filament.filament_vendor, ["SUNLU"]);
+  assert.ok(filament.nozzle_temperature.every((value) => value === "245"));
+  assert.equal(filament.filament_id, "GFSNL08");
 });
 
 test("end-to-end: H2D matches GUI-sliced ground-truth shape for nozzle_volume_type", async (t) => {

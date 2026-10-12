@@ -28,4 +28,7 @@ jobs:
       - run: npm audit --omit=dev
       - run: npm run privacy:check
       - run: npm run privacy:history
+        env:
+          PRIVACY_SCAN_REF: ${{ github.sha }}
+          PRIVACY_SCAN_SKIP_SYNTHETIC_TIP_METADATA: ${{ github.event_name == 'pull_request' && '1' || '0' }}
       - run: npm pack --dry-run
