@@ -1,0 +1,188 @@
+import groovy.json.JsonOutput
+
+// Install this reviewed definition in a trusted job. Never load it from a PR.
+// One job per event ref; runner labels below are prerequisites, not live claims.
+properties([
+    parameters([string(name: 'TARGET_SHA', defaultValue: '', description: 'Exact event commit: lowercase 40-hex; PRs use the synthetic merge SHA')])
+])
+if (!(params.TARGET_SHA ==~ /[0-9a-f]{40}/)) {
+    error('TARGET_SHA must be a complete lowercase 40-hex commit')
+}
+
+def runGate(name, command, gates) {
+    gates[name] = 'RUNNING'
+    try {
+        sh(label: name, script: "#!/usr/bin/env bash\nset -euo pipefail\n{\n${command}\n} 2>&1 | tee ../diagnostics/${name}.log\n")
+        gates[name] = 'SUCCESS'
+    } catch (err) {
+        gates[name] = 'FAILURE'
+        throw err
+    }
+}
+
+// Capture bytes, types and modes before target code runs. The reference string
+// stays in controller state; mutable Git index flags cannot change that reference.
+def sourceManifest(expected = null) {
+    if (expected != null) { writeFile(file: '../expected-source.json', text: expected) }
+    withEnv(["MANIFEST_INPUT=${expected == null ? 'git' : 'stored'}"]) {
+        return sh(label: expected == null ? 'snapshot-source' : 'source-manifest', returnStdout: true, script: '''#!/usr/bin/env python3
+import hashlib, json, os, stat, subprocess
+if os.environ['MANIFEST_INPUT'] == 'git':
+    paths = [os.fsdecode(p) for p in subprocess.check_output(['git', 'ls-files', '-z']).split(bytes([0])) if p]
+else:
+    paths = [entry['path'] for entry in json.load(open('../expected-source.json'))]
+entries = []
+for path in sorted(paths):
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        kind, data = 'symlink', os.fsencode(os.readlink(path))
+    elif stat.S_ISREG(info.st_mode):
+        kind, data = 'file', open(path, 'rb').read()
+    else:
+        raise RuntimeError('Unsupported tracked file type')
+    entries.append(dict(path=path, kind=kind, mode=stat.S_IMODE(info.st_mode), sha256=hashlib.sha256(data).hexdigest()))
+print(json.dumps(entries, sort_keys=True, separators=(',', ':')))
+''').trim()
+    }
+}
+
+def verifySource(expected, gates) {
+    gates['source-integrity'] = 'RUNNING'
+    try {
+        sh(label: 'source-integrity', script: '''#!/usr/bin/env bash
+set -euo pipefail
+test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+git ls-files -z | git update-index --no-assume-unchanged -z --stdin
+git ls-files -z | git update-index --no-skip-worktree -z --stdin
+git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --exit-code --
+git diff --cached --no-ext-diff --no-textconv --exit-code --
+''')
+        if (sourceManifest(expected) != expected) { error('Tracked source bytes, type or modes changed') }
+        gates['source-integrity'] = 'SUCCESS'
+    } catch (err) {
+        gates['source-integrity'] = 'FAILURE'
+        throw err
+    }
+}
+
+// The fixed leg must be a real directory; a receipt may only be a regular file.
+def checkReceiptPath(leg, requireFile = false) {
+    sh(label: 'receipt-safety', script: """#!/usr/bin/env bash
+set -euo pipefail
+parent="${leg}"
+receipt="${leg}/receipt.json"
+test ! -L "\$parent"
+if [ ! -e "\$parent" ]; then mkdir "\$parent"; fi
+test -d "\$parent"
+test ! -L "\$receipt"
+if [ -e "\$receipt" ] || [ "${requireFile}" = true ]; then
+    test -f "\$receipt"
+fi
+""")
+}
+
+def runLeg(version) {
+    def gates = ['checkout': 'NOT_RUN', 'snapshot-source': 'NOT_RUN', 'runtime': 'NOT_RUN', 'install': 'NOT_RUN', 'tests': 'NOT_RUN', 'audit': 'NOT_RUN', 'privacy': 'NOT_RUN', 'history': 'NOT_RUN', 'package': 'NOT_RUN', 'source-integrity': 'NOT_RUN', 'artifact-safety': 'NOT_RUN', 'receipt-safety': 'NOT_RUN']
+    def result = 'FAILURE'
+    def verified = false
+    def primaryError = null
+    def manifest = null
+    def leg = 'node-' + version
+    node("ci-linux-node${version}-ephemeral") {
+        deleteDir()
+        try {
+            timeout(time: 15, unit: 'MINUTES') {
+                sh "mkdir -p ${leg}/diagnostics"
+                dir("${leg}/source") {
+                    gates.checkout = 'RUNNING'
+                    checkout([$class: 'GitSCM', branches: [[name: params.TARGET_SHA]],
+                        userRemoteConfigs: [[url: 'https://github.com/ceweldy/bambu-printer-mcp.git',
+                            refspec: "+refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/* +${params.TARGET_SHA}:refs/remotes/origin/event-target"]],
+                        extensions: [[$class: 'CloneOption', shallow: false, noTags: false, honorRefspec: true]]])
+                    def actual = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                    if (actual != params.TARGET_SHA) {
+                        error('Checkout did not resolve the requested exact commit')
+                    }
+                    verified = true
+                    gates.checkout = 'SUCCESS'
+                    gates['snapshot-source'] = 'RUNNING'
+                    manifest = sourceManifest()
+                    gates['snapshot-source'] = 'SUCCESS'
+                    withEnv([] + ["EXPECTED_SHA=${params.TARGET_SHA}"]) {
+                        runGate('runtime', "node --version\nnode -e \"if (process.versions.node.split('.')[0] !== '${version}') process.exit(1)\"\nuname -s | grep -qx Linux", gates)
+                        runGate('install', "npm ci", gates)
+                        runGate('tests', "npm test", gates)
+                        runGate('audit', "npm audit --omit=dev", gates)
+                        runGate('privacy', "npm run privacy:check", gates)
+                        runGate('history', "npm run privacy:history", gates)
+                        runGate('package', "npm pack --dry-run", gates)
+                        verifySource(manifest, gates)
+                    }
+                }
+                result = 'SUCCESS'
+            }
+        } catch (err) {
+            if (gates.checkout == 'RUNNING') {
+                gates.checkout = 'FAILURE'
+            }
+            if (gates['snapshot-source'] == 'RUNNING') { gates['snapshot-source'] = 'FAILURE' }
+            // Interrupted builds must never produce a success receipt.
+            result = err.class.name == 'org.jenkinsci.plugins.workflow.steps.FlowInterruptedException' ? 'ABORTED' : 'FAILURE'
+            primaryError = err
+        } finally {
+            // Logs and outputs are untrusted diagnostics, never status authority.
+            // Archive before cleanup even if a gate fails or the build is aborted.
+            try {
+                timeout(time: 5, unit: 'MINUTES') {
+                    gates['artifact-safety'] = 'RUNNING'
+                    try {
+                        sh(label: 'artifact-safety', script: """#!/usr/bin/env bash
+set -euo pipefail
+for root in "${leg}/diagnostics"; do
+    path="\$root"
+    while [ "\$path" != . ]; do
+        test ! -L "\$path"
+        if [ -e "\$path" ]; then test -d "\$path"; fi
+        path="\$(dirname "\$path")"
+    done
+    if [ -d "\$root" ]; then
+        test -z "\$(find "\$root" ! -type f ! -type d -print -quit)"
+    fi
+done
+""")
+                        gates['artifact-safety'] = 'SUCCESS'
+                    } catch (err) {
+                        gates['artifact-safety'] = 'FAILURE'
+                        if (primaryError == null) { primaryError = err; result = 'FAILURE' }
+                    }
+                    if (gates['artifact-safety'] == 'SUCCESS') {
+                        archiveArtifacts(artifacts: "${leg}/diagnostics/*.log,${leg}/diagnostics/*.xml", allowEmptyArchive: true)
+                    }
+                    gates['receipt-safety'] = 'RUNNING'
+                    try {
+                        checkReceiptPath(leg)
+                        gates['receipt-safety'] = 'SUCCESS'
+                        def receipt = [schema: 1, repository: 'ceweldy/bambu-printer-mcp',
+                        commit: params.TARGET_SHA, checkout_verified: verified,
+                        build_url: env.BUILD_URL ?: '', result: result, gates: gates,
+                        mode: 'shadow', matrix: [node: version]]
+                        writeFile(file: "${leg}/receipt.json", text: JsonOutput.prettyPrint(JsonOutput.toJson(receipt)) + '\n')
+                        checkReceiptPath(leg, true)
+                        archiveArtifacts(artifacts: "${leg}/receipt.json", allowEmptyArchive: false)
+                    } catch (err) {
+                        gates['receipt-safety'] = 'FAILURE'
+                        if (primaryError == null) { primaryError = err; result = 'FAILURE' }
+                    }
+                }
+            } finally {
+                timeout(time: 1, unit: 'MINUTES') { deleteDir() }
+            }
+        }
+        if (primaryError != null) { throw primaryError }
+    }
+}
+
+def branches = [:]
+branches['node-20'] = { stage('node-20') { runLeg('20') } }
+branches['node-22'] = { stage('node-22') { runLeg('22') } }
+parallel(branches + [failFast: true])
